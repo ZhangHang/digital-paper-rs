@@ -1,0 +1,15 @@
+[package]
+name = "digital-paper-tui"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+crossterm.workspace = true
+parking_lot.workspace = true
+ratatui.workspace = true
+digital-paper-domain = { path = "../../crates/digital-paper-domain" }
+digital-paper-provider = { path = "../../crates/digital-paper-provider" }
+if-addrs = "0.13"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }

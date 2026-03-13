@@ -1,0 +1,22 @@
+[package]
+name = "digital-paper-gpui"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[package.metadata.bundle]
+name = "Digital Paper"
+identifier = "local.digital-paper-rs.app"
+icon = ["../../assets/icon.icns"]
+category = "Productivity"
+
+[dependencies]
+anyhow.workspace = true
+gpui = "0.2.2"
+gpui-component = "0.5.1"
+parking_lot.workspace = true
+digital-paper-domain = { path = "../../crates/digital-paper-domain" }
+digital-paper-provider = { path = "../../crates/digital-paper-provider" }
+if-addrs = "0.13"
+rfd = "0.15"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
