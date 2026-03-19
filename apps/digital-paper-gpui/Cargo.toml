@@ -7,7 +7,7 @@ version.workspace = true
 [package.metadata.bundle]
 name = "Digital Paper"
 identifier = "local.digital-paper-rs.app"
-icon = ["../../assets/icon.icns"]
+icon = ["assets/icon.icns"]
 category = "Productivity"
 
 [dependencies]
