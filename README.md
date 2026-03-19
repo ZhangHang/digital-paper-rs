@@ -1,81 +1,89 @@
-# Digital Paper
+# digital-paper-rs
 
-Personal Sony Digital Paper manager for macOS.
+Rust workspace for managing Sony Digital Paper devices.
 
-Repo name: `digital-paper-rs`
+This repo ships three applications:
 
-This repo ships three Rust targets:
+- `digital-paper-cli` (CLI)
+- `digital-paper-tui` (terminal UI)
+- `digital-paper-gpui` (desktop app)
 
-- `digital-paper-cli`: command-line tool
-- `digital-paper-tui`: terminal UI
-- `digital-paper-gpui`: macOS desktop app
+It is inspired by:
 
-It is inspired by and based on parts of [HappyZ/dpt-tools](https://github.com/HappyZ/dpt-tools), but this repo is a separate Rust-first implementation for my own usage.
+- [HappyZ/dpt-tools](https://github.com/HappyZ/dpt-tools)
+- [janten/dpt-rp1-py](https://github.com/janten/dpt-rp1-py)
 
-This codebase is entirely vibe coded. It is pragmatic, personal software, not a polished general-purpose product.
+This repository is implemented as a Rust-first project for personal usage.
 
-## Scope
+## Features
 
-- personal-use project
-- only tested on macOS
-- Wi-Fi is the reliable path today
-- USB may still fail depending on device state and macOS USB networking behavior
+- Device connect/pair flows
+- File browser and transfer (upload/download/delete/rename/move/copy)
+- Sync and utility commands in CLI
+- Mouse-capable TUI (Ghostty/iTerm-compatible)
+- Desktop app for daily document management
 
-## What Is In The Repo
+## Project Scope
 
-- `apps/digital-paper-cli`: CLI for discovery, pairing, sync, and file operations
-- `apps/digital-paper-tui`: mouse-capable terminal UI
-- `apps/digital-paper-gpui`: macOS GUI app
-- `crates/digital-paper-domain`: shared data models and errors
-- `crates/digital-paper-provider`: provider traits and shared wiring
-- `crates/digital-paper-rust-provider`: native Rust device transport and auth
+- Primary target: macOS
+- Main reliable path: Wi-Fi
+- USB transport is supported, but can still fail on some macOS/network setups
+- This is personal software and intentionally pragmatic
 
-## What Is Not Shipped
+## Repository Layout
 
-The old Python `dpt-tools` reference code is kept only as a local development reference. It is not part of the shipped product surface and should not be treated as a supported runtime path.
+- `apps/digital-paper-cli` CLI app
+- `apps/digital-paper-tui` terminal UI app
+- `apps/digital-paper-gpui` desktop app
+- `crates/digital-paper-domain` shared types/constants/errors
+- `crates/digital-paper-provider` provider interface layer
+- `crates/digital-paper-rust-provider` native Rust implementation
 
-## Naming
+## Quick Start
 
-- repo/workspace name: `digital-paper-rs`
-- product name: `Digital Paper`
-- internal crate and binary prefixes: `digital-paper-*`
+Requirements:
 
-The repo name is intentionally different from the app name. The repo describes the Rust workspace; the shipped app stays `Digital Paper`.
+- Rust toolchain (stable)
+- macOS
 
-## Running
+Run:
 
-CLI:
+```bash
+make check
+make build
+make run-cli ARGS="discover"
+make run-tui
+make run-gui
+```
+
+Direct cargo examples:
 
 ```bash
 cargo run -p digital-paper-cli -- discover
-```
-
-TUI:
-
-```bash
 cargo run -p digital-paper-tui
-```
-
-GUI:
-
-```bash
 cargo run -p digital-paper-gpui
 ```
 
-Build the macOS app bundle:
+## Configuration
+
+- `DPT_DEFAULT_ADDR`: default target address used by TUI/GPUI add-device flows (defaults to `digitalpaper.local`)
+
+Bundle app:
 
 ```bash
-cargo bundle -p digital-paper-gpui --release
+make bundle
 ```
 
-Bundle output:
+Output:
 
 ```text
 target/release/bundle/osx/Digital Paper.app
 ```
 
-## Notes
+## Contributing
 
-- pairing and daily use are expected to happen over Wi-Fi
-- USB support is still under active experimentation
-- the TUI supports keyboard, mouse, recursive search, and context menus in modern terminals like Ghostty
+Contributions are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) for setup and contribution workflow.
+
+## License
+
+Licensed under Apache-2.0. See [LICENSE](LICENSE).

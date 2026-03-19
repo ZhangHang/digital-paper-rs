@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use digital_paper_domain::{RemoteEntry, RemoteEntryType};
+use digital_paper_domain::{RemoteEntry, RemoteEntryType, UsbSwitchMode, WifiConfigInput};
 use digital_paper_provider::{rust_native_provider, ProviderRef};
 use digital_paper_rust_provider::RustNativeProvider;
 use serde::Serialize;
@@ -13,6 +13,8 @@ use std::fs;
 struct Cli {
     #[arg(long, global = true)]
     json: bool,
+    #[arg(long, global = true)]
+    serial: Option<String>,
     #[command(subcommand)]
     command: Command,
 }
@@ -26,10 +28,17 @@ enum Command {
         #[arg(default_value = "Document")]
         path: String,
     },
+    #[command(visible_alias = "open")]
     Connect {
         #[arg(long)]
         addr: Option<String>,
     },
+    UsbStatus,
+    UsbSwitch {
+        #[arg(long, default_value = "auto")]
+        mode: UsbSwitchModeArg,
+    },
+    UsbRecover,
     Pair {
         #[arg(long)]
         addr: Option<String>,
@@ -96,12 +105,14 @@ enum Command {
         path: String,
         new_name: String,
     },
+    #[command(visible_alias = "move-document")]
     Move {
         #[arg(long)]
         addr: Option<String>,
         src: String,
         dst: String,
     },
+    #[command(visible_alias = "copy-document")]
     Copy {
         #[arg(long)]
         addr: Option<String>,
@@ -117,7 +128,7 @@ enum Command {
         #[arg(long)]
         addr: Option<String>,
         local_path: String,
-        remote_path: String,
+        remote_path: Option<String>,
     },
     Download {
         #[arg(long)]
@@ -130,6 +141,10 @@ enum Command {
         addr: Option<String>,
         local_path: String,
         remote_path: String,
+        #[arg(long)]
+        dry_run: bool,
+        #[arg(long, short = 'y')]
+        yes: bool,
     },
     RegisterInfo {
         #[arg(long)]
@@ -159,13 +174,29 @@ enum Command {
         #[arg(long)]
         addr: Option<String>,
     },
+    #[command(visible_alias = "wifi-add")]
     AddWifi {
         #[arg(long)]
         addr: Option<String>,
         ssid: String,
         security: String,
         passwd: String,
+        #[arg(long, default_value = "true")]
+        dhcp: String,
+        #[arg(long, default_value = "")]
+        static_address: String,
+        #[arg(long, default_value = "")]
+        gateway: String,
+        #[arg(long, default_value = "")]
+        network_mask: String,
+        #[arg(long, default_value = "")]
+        dns1: String,
+        #[arg(long, default_value = "")]
+        dns2: String,
+        #[arg(long, default_value = "false")]
+        proxy: String,
     },
+    #[command(visible_alias = "wifi-del")]
     RemoveWifi {
         #[arg(long)]
         addr: Option<String>,
@@ -190,6 +221,16 @@ enum Command {
         addr: Option<String>,
         key: String,
         value: String,
+    },
+    GetConfiguration {
+        #[arg(long)]
+        addr: Option<String>,
+        path: String,
+    },
+    SetConfiguration {
+        #[arg(long)]
+        addr: Option<String>,
+        path: String,
     },
     SetDatetime {
         #[arg(long)]
@@ -252,11 +293,26 @@ fn main() -> Result<()> {
 
     match cli.command {
         Command::Discover => {
-            let devices = provider.discover_devices()?;
+            let mut devices = provider.discover_devices()?;
+            if let Some(serial) = cli.serial.as_ref() {
+                devices.retain(|d| d.serial.as_deref() == Some(serial.as_str()));
+            }
             print_output(cli.json, &devices)
         }
+        Command::UsbStatus => {
+            let status = provider.usb_status()?;
+            print_output(cli.json, &status)
+        }
+        Command::UsbSwitch { mode } => {
+            let status = provider.usb_switch_mode(mode.into())?;
+            print_output(cli.json, &status)
+        }
+        Command::UsbRecover => {
+            let status = provider.usb_recover()?;
+            print_output(cli.json, &status)
+        }
         Command::Validate { addr, path } => {
-            ensure_connected(&provider, addr)?;
+            ensure_connected(&provider, addr, cli.serial.clone())?;
             provider.validate_access(path.clone())?;
             print_output(
                 cli.json,
@@ -264,18 +320,18 @@ fn main() -> Result<()> {
             )
         }
         Command::Connect { addr } => {
-            let device = provider.connect(addr, None, None)?;
+            let device = provider.connect(addr, cli.serial.clone(), None)?;
             print_output(cli.json, &device)
         }
         Command::Pair { addr, pin } => {
-            ensure_connected(&provider, addr)?;
+            ensure_connected(&provider, addr, cli.serial.clone())?;
             let device = provider.pair(pin)?;
             print_output(cli.json, &device)
         }
         Command::PairBegin { addr } => pair_begin(cli.json, addr),
         Command::PairFinish { pin } => pair_finish(cli.json, pin),
         Command::Info { addr } => {
-            ensure_connected(&provider, addr)?;
+            ensure_connected(&provider, addr, cli.serial.clone())?;
             let info = provider.device_info()?;
             print_output(cli.json, &info)
         }
@@ -284,7 +340,7 @@ fn main() -> Result<()> {
             path,
             recursive,
         } => {
-            ensure_connected(&provider, addr)?;
+            ensure_connected(&provider, addr, cli.serial.clone())?;
             let entries = if recursive {
                 list_entries_recursive(&provider, &path)?
             } else {
@@ -293,37 +349,37 @@ fn main() -> Result<()> {
             print_output(cli.json, &entries)
         }
         Command::ListAll { addr } => {
-            ensure_connected(&provider, addr)?;
+            ensure_connected(&provider, addr, cli.serial.clone())?;
             let entries = provider.list_all_entries()?;
             print_output(cli.json, &entries)
         }
         Command::ListDocuments { addr } => {
-            ensure_connected(&provider, addr)?;
+            ensure_connected(&provider, addr, cli.serial.clone())?;
             let entries = provider.list_document_entries()?;
             print_output(cli.json, &entries)
         }
         Command::Stat { addr, path } => {
-            ensure_connected(&provider, addr)?;
+            ensure_connected(&provider, addr, cli.serial.clone())?;
             let entry = stat_entry(&provider, &path)?;
             print_output(cli.json, &entry)
         }
         Command::Find { addr, path, name } => {
-            ensure_connected(&provider, addr)?;
+            ensure_connected(&provider, addr, cli.serial.clone())?;
             let entries = find_entries_by_name(&provider, &path, &name)?;
             print_output(cli.json, &entries)
         }
         Command::Exists { addr, path } => {
-            ensure_connected(&provider, addr)?;
+            ensure_connected(&provider, addr, cli.serial.clone())?;
             let exists = provider.path_exists(path.clone())?;
             print_output(cli.json, &json!({ "path": path, "exists": exists }))
         }
         Command::IsFolder { addr, path } => {
-            ensure_connected(&provider, addr)?;
+            ensure_connected(&provider, addr, cli.serial.clone())?;
             let is_folder = provider.path_is_folder(path.clone())?;
             print_output(cli.json, &json!({ "path": path, "isFolder": is_folder }))
         }
         Command::Mkdir { addr, path } => {
-            ensure_connected(&provider, addr)?;
+            ensure_connected(&provider, addr, cli.serial.clone())?;
             provider.create_folder(path.clone())?;
             print_output(
                 cli.json,
@@ -335,7 +391,7 @@ fn main() -> Result<()> {
             path,
             new_name,
         } => {
-            ensure_connected(&provider, addr)?;
+            ensure_connected(&provider, addr, cli.serial.clone())?;
             provider.rename_entry(path.clone(), new_name.clone())?;
             print_output(
                 cli.json,
@@ -343,7 +399,7 @@ fn main() -> Result<()> {
             )
         }
         Command::Move { addr, src, dst } => {
-            ensure_connected(&provider, addr)?;
+            ensure_connected(&provider, addr, cli.serial.clone())?;
             provider.move_entry(src.clone(), dst.clone())?;
             print_output(
                 cli.json,
@@ -351,7 +407,7 @@ fn main() -> Result<()> {
             )
         }
         Command::Copy { addr, src, dst } => {
-            ensure_connected(&provider, addr)?;
+            ensure_connected(&provider, addr, cli.serial.clone())?;
             provider.copy_entry(src.clone(), dst.clone())?;
             print_output(
                 cli.json,
@@ -359,7 +415,7 @@ fn main() -> Result<()> {
             )
         }
         Command::Delete { addr, path } => {
-            ensure_connected(&provider, addr)?;
+            ensure_connected(&provider, addr, cli.serial.clone())?;
             provider.delete(path.clone())?;
             print_output(
                 cli.json,
@@ -371,11 +427,18 @@ fn main() -> Result<()> {
             local_path,
             remote_path,
         } => {
-            ensure_connected(&provider, addr)?;
-            provider.upload(local_path.clone(), remote_path.clone())?;
+            ensure_connected(&provider, addr, cli.serial.clone())?;
+            let target = remote_path.unwrap_or_else(|| {
+                let name = std::path::Path::new(&local_path)
+                    .file_name()
+                    .and_then(|v| v.to_str())
+                    .unwrap_or("upload.pdf");
+                format!("Document/{name}")
+            });
+            provider.upload(local_path.clone(), target.clone())?;
             print_output(
                 cli.json,
-                &json!({ "ok": true, "localPath": local_path, "remotePath": remote_path, "action": "upload" }),
+                &json!({ "ok": true, "localPath": local_path, "remotePath": target, "action": "upload" }),
             )
         }
         Command::Download {
@@ -383,7 +446,7 @@ fn main() -> Result<()> {
             remote_path,
             local_path,
         } => {
-            ensure_connected(&provider, addr)?;
+            ensure_connected(&provider, addr, cli.serial.clone())?;
             provider.download(remote_path.clone(), local_path.clone())?;
             print_output(
                 cli.json,
@@ -394,9 +457,11 @@ fn main() -> Result<()> {
             addr,
             local_path,
             remote_path,
+            dry_run,
+            yes,
         } => {
-            ensure_connected(&provider, addr)?;
-            let result = provider.sync_folder(local_path, remote_path)?;
+            ensure_connected(&provider, addr, cli.serial.clone())?;
+            let result = provider.sync_folder(local_path, remote_path, dry_run, yes)?;
             print_output(cli.json, &result)
         }
         Command::RegisterInfo { addr } => {
@@ -404,17 +469,17 @@ fn main() -> Result<()> {
             print_output(cli.json, &info)
         }
         Command::Battery { addr } => {
-            ensure_connected(&provider, addr)?;
+            ensure_connected(&provider, addr, cli.serial.clone())?;
             let info = provider.battery_info()?;
             print_output(cli.json, &info)
         }
         Command::FirmwareVersion { addr } => {
-            ensure_connected(&provider, addr)?;
+            ensure_connected(&provider, addr, cli.serial.clone())?;
             let value = provider.firmware_version()?;
             print_output(cli.json, &json!({ "value": value }))
         }
         Command::MacAddress { addr } => {
-            ensure_connected(&provider, addr)?;
+            ensure_connected(&provider, addr, cli.serial.clone())?;
             let value = provider.mac_address()?;
             print_output(cli.json, &json!({ "value": value }))
         }
@@ -423,12 +488,12 @@ fn main() -> Result<()> {
             print_output(cli.json, &json!({ "value": value }))
         }
         Command::ListWifi { addr } => {
-            ensure_connected(&provider, addr)?;
+            ensure_connected(&provider, addr, cli.serial.clone())?;
             let items = provider.list_wifi()?;
             print_output(cli.json, &items)
         }
         Command::ScanWifi { addr } => {
-            ensure_connected(&provider, addr)?;
+            ensure_connected(&provider, addr, cli.serial.clone())?;
             let items = provider.scan_wifi()?;
             print_output(cli.json, &items)
         }
@@ -437,9 +502,28 @@ fn main() -> Result<()> {
             ssid,
             security,
             passwd,
+            dhcp,
+            static_address,
+            gateway,
+            network_mask,
+            dns1,
+            dns2,
+            proxy,
         } => {
-            ensure_connected(&provider, addr)?;
-            provider.add_wifi(ssid.clone(), security.clone(), passwd)?;
+            ensure_connected(&provider, addr, cli.serial.clone())?;
+            let cfg = WifiConfigInput {
+                ssid: ssid.clone(),
+                security: security.clone(),
+                passwd,
+                dhcp,
+                static_address,
+                gateway,
+                network_mask,
+                dns1,
+                dns2,
+                proxy,
+            };
+            provider.add_wifi_full(cfg)?;
             print_output(
                 cli.json,
                 &json!({ "ok": true, "ssid": ssid, "security": security, "action": "add_wifi" }),
@@ -450,7 +534,7 @@ fn main() -> Result<()> {
             ssid,
             security,
         } => {
-            ensure_connected(&provider, addr)?;
+            ensure_connected(&provider, addr, cli.serial.clone())?;
             provider.remove_wifi(ssid.clone(), security.clone())?;
             print_output(
                 cli.json,
@@ -458,17 +542,17 @@ fn main() -> Result<()> {
             )
         }
         Command::EnableWifi { addr } => {
-            ensure_connected(&provider, addr)?;
+            ensure_connected(&provider, addr, cli.serial.clone())?;
             provider.toggle_wifi(true)?;
             print_output(cli.json, &json!({ "ok": true, "enabled": true }))
         }
         Command::DisableWifi { addr } => {
-            ensure_connected(&provider, addr)?;
+            ensure_connected(&provider, addr, cli.serial.clone())?;
             provider.toggle_wifi(false)?;
             print_output(cli.json, &json!({ "ok": true, "enabled": false }))
         }
         Command::ConfigGet { addr, key } => {
-            ensure_connected(&provider, addr)?;
+            ensure_connected(&provider, addr, cli.serial.clone())?;
             match key {
                 Some(key) => {
                     let value = provider.get_config_value(key.clone())?;
@@ -481,7 +565,7 @@ fn main() -> Result<()> {
             }
         }
         Command::ConfigSet { addr, key, value } => {
-            ensure_connected(&provider, addr)?;
+            ensure_connected(&provider, addr, cli.serial.clone())?;
             let parsed = parse_json_or_string(&value);
             provider.set_config_value(key.clone(), parsed.clone())?;
             print_output(
@@ -489,13 +573,29 @@ fn main() -> Result<()> {
                 &json!({ "ok": true, "key": key, "value": parsed, "action": "config_set" }),
             )
         }
+        Command::GetConfiguration { addr, path } => {
+            ensure_connected(&provider, addr, cli.serial.clone())?;
+            let value = provider.get_config()?;
+            fs::write(&path, serde_json::to_string_pretty(&value)?)
+                .with_context(|| format!("failed to write configuration to {path}"))?;
+            print_output(cli.json, &json!({ "ok": true, "path": path }))
+        }
+        Command::SetConfiguration { addr, path } => {
+            ensure_connected(&provider, addr, cli.serial.clone())?;
+            let text = fs::read_to_string(&path)
+                .with_context(|| format!("failed to read configuration from {path}"))?;
+            let value: Value =
+                serde_json::from_str(&text).with_context(|| format!("invalid JSON in {path}"))?;
+            provider.set_config(value)?;
+            print_output(cli.json, &json!({ "ok": true, "path": path }))
+        }
         Command::SetDatetime { addr } => {
-            ensure_connected(&provider, addr)?;
+            ensure_connected(&provider, addr, cli.serial.clone())?;
             provider.set_datetime_now()?;
             print_output(cli.json, &json!({ "ok": true, "action": "set_datetime" }))
         }
         Command::ListTemplates { addr } => {
-            ensure_connected(&provider, addr)?;
+            ensure_connected(&provider, addr, cli.serial.clone())?;
             let items = provider.list_templates()?;
             print_output(cli.json, &items)
         }
@@ -504,7 +604,7 @@ fn main() -> Result<()> {
             local_path,
             remote_path,
         } => {
-            ensure_connected(&provider, addr)?;
+            ensure_connected(&provider, addr, cli.serial.clone())?;
             provider.upload_template(local_path.clone(), remote_path.clone())?;
             print_output(
                 cli.json,
@@ -515,7 +615,7 @@ fn main() -> Result<()> {
             addr,
             template_name,
         } => {
-            ensure_connected(&provider, addr)?;
+            ensure_connected(&provider, addr, cli.serial.clone())?;
             provider.delete_template(template_name.clone())?;
             print_output(
                 cli.json,
@@ -527,7 +627,7 @@ fn main() -> Result<()> {
             document_id,
             page,
         } => {
-            ensure_connected(&provider, addr)?;
+            ensure_connected(&provider, addr, cli.serial.clone())?;
             provider.display_document(document_id.clone(), page)?;
             print_output(
                 cli.json,
@@ -535,7 +635,7 @@ fn main() -> Result<()> {
             )
         }
         Command::Screenshot { addr, output_path } => {
-            ensure_connected(&provider, addr)?;
+            ensure_connected(&provider, addr, cli.serial.clone())?;
             let image = provider.take_screenshot()?;
             fs::write(&output_path, &image)
                 .with_context(|| format!("failed to write screenshot to {output_path}"))?;
@@ -545,12 +645,12 @@ fn main() -> Result<()> {
             )
         }
         Command::Ping { addr } => {
-            ensure_connected(&provider, addr)?;
+            ensure_connected(&provider, addr, cli.serial.clone())?;
             let ok = provider.ping()?;
             print_output(cli.json, &json!({ "ok": ok }))
         }
         Command::UpdateFirmware { addr, local_path } => {
-            ensure_connected(&provider, addr)?;
+            ensure_connected(&provider, addr, cli.serial.clone())?;
             provider.update_firmware(local_path.clone())?;
             print_output(
                 cli.json,
@@ -572,7 +672,7 @@ fn main() -> Result<()> {
         }
         Command::Logs { addr } => {
             if addr.is_some() {
-                ensure_connected(&provider, addr)?;
+                ensure_connected(&provider, addr, cli.serial.clone())?;
             }
             let logs = provider.read_logs()?;
             print_output(cli.json, &logs)
@@ -580,9 +680,28 @@ fn main() -> Result<()> {
     }
 }
 
-fn ensure_connected(provider: &ProviderRef, addr: Option<String>) -> Result<()> {
-    provider.connect(addr, None, None).context("connect failed")?;
+fn ensure_connected(provider: &ProviderRef, addr: Option<String>, serial: Option<String>) -> Result<()> {
+    provider
+        .connect(addr, serial, None)
+        .context("connect failed")?;
     Ok(())
+}
+
+#[derive(Debug, Clone, clap::ValueEnum)]
+enum UsbSwitchModeArg {
+    Auto,
+    Ecm,
+    Rndis,
+}
+
+impl From<UsbSwitchModeArg> for UsbSwitchMode {
+    fn from(value: UsbSwitchModeArg) -> Self {
+        match value {
+            UsbSwitchModeArg::Auto => UsbSwitchMode::Auto,
+            UsbSwitchModeArg::Ecm => UsbSwitchMode::Ecm,
+            UsbSwitchModeArg::Rndis => UsbSwitchMode::Rndis,
+        }
+    }
 }
 
 fn list_entries_recursive(provider: &ProviderRef, root: &str) -> Result<Vec<RemoteEntry>> {
@@ -673,7 +792,8 @@ mod tests {
     use anyhow::anyhow;
     use digital_paper_domain::{
         AdvancedCapabilities, BatteryStatus, ConnectionLog, DeviceStatus, DeviceSummary,
-        StorageStatus, TransportKind, WifiNetwork,
+        StorageStatus, TransportKind, UsbStatus, UsbStatusKind, UsbSwitchMode, WifiConfigInput,
+        WifiNetwork, USB_FALLBACK_ADDR,
     };
     use digital_paper_provider::DptProvider;
     use std::collections::HashMap;
@@ -827,6 +947,10 @@ mod tests {
             unsupported()
         }
 
+        fn add_wifi_full(&self, _config: WifiConfigInput) -> Result<()> {
+            unsupported()
+        }
+
         fn remove_wifi(&self, _ssid: String, _security: String) -> Result<()> {
             unsupported()
         }
@@ -840,6 +964,10 @@ mod tests {
         }
 
         fn get_config_value(&self, _key: String) -> Result<Value> {
+            unsupported()
+        }
+
+        fn set_config(&self, _config: Value) -> Result<()> {
             unsupported()
         }
 
@@ -879,8 +1007,33 @@ mod tests {
             unsupported()
         }
 
-        fn sync_folder(&self, _local_path: String, _remote_path: String) -> Result<Value> {
+        fn sync_folder(
+            &self,
+            _local_path: String,
+            _remote_path: String,
+            _dry_run: bool,
+            _assume_yes: bool,
+        ) -> Result<Value> {
             unsupported()
+        }
+
+        fn usb_status(&self) -> Result<UsbStatus> {
+            Ok(UsbStatus {
+                kind: UsbStatusKind::NoUsbHardware,
+                tty_paths: Vec::new(),
+                iface_names: Vec::new(),
+                candidate_addrs: Vec::new(),
+                endpoint_addr: None,
+                message: "none".into(),
+            })
+        }
+
+        fn usb_switch_mode(&self, _mode: UsbSwitchMode) -> Result<UsbStatus> {
+            self.usb_status()
+        }
+
+        fn usb_recover(&self) -> Result<UsbStatus> {
+            self.usb_status()
         }
 
         fn import_credentials(
@@ -1011,25 +1164,52 @@ mod tests {
             vec!["digital-paper-cli", "stat", "Document/foo.pdf"],
             vec!["digital-paper-cli", "find", "--name", "2026-03-13"],
             vec!["digital-paper-cli", "sync", "./out", "Document/Summaries"],
+            vec!["digital-paper-cli", "sync", "./out", "Document/Summaries", "--dry-run"],
+            vec!["digital-paper-cli", "usb-status"],
+            vec!["digital-paper-cli", "usb-switch", "--mode", "ecm"],
+            vec!["digital-paper-cli", "usb-recover"],
             vec!["digital-paper-cli", "move", "Document/a.pdf", "Document/b.pdf"],
+            vec!["digital-paper-cli", "move-document", "Document/a.pdf", "Document/b.pdf"],
             vec!["digital-paper-cli", "copy", "Document/a.pdf", "Document/b.pdf"],
+            vec!["digital-paper-cli", "copy-document", "Document/a.pdf", "Document/b.pdf"],
             vec!["digital-paper-cli", "list-all"],
             vec!["digital-paper-cli", "list-documents"],
             vec!["digital-paper-cli", "exists", "Document/foo.pdf"],
             vec!["digital-paper-cli", "is-folder", "Document"],
-            vec!["digital-paper-cli", "register-info", "--addr", "172.25.47.1"],
+            vec!["digital-paper-cli", "register-info", "--addr", USB_FALLBACK_ADDR],
             vec!["digital-paper-cli", "battery"],
             vec!["digital-paper-cli", "firmware-version"],
             vec!["digital-paper-cli", "mac-address"],
-            vec!["digital-paper-cli", "api-version", "--addr", "172.25.47.1"],
+            vec!["digital-paper-cli", "api-version", "--addr", USB_FALLBACK_ADDR],
             vec!["digital-paper-cli", "list-wifi"],
             vec!["digital-paper-cli", "scan-wifi"],
             vec!["digital-paper-cli", "add-wifi", "ssid", "psk", "secret"],
+            vec![
+                "digital-paper-cli",
+                "add-wifi",
+                "ssid",
+                "psk",
+                "secret",
+                "--dhcp",
+                "false",
+                "--static-address",
+                "172.20.10.2",
+                "--gateway",
+                "172.20.10.1",
+                "--network-mask",
+                "24",
+                "--dns1",
+                "8.8.8.8",
+                "--proxy",
+                "false"
+            ],
             vec!["digital-paper-cli", "remove-wifi", "ssid", "psk"],
             vec!["digital-paper-cli", "enable-wifi"],
             vec!["digital-paper-cli", "disable-wifi"],
             vec!["digital-paper-cli", "config-get", "owner"],
             vec!["digital-paper-cli", "config-set", "owner", "\"me\""],
+            vec!["digital-paper-cli", "get-configuration", "./cfg.json"],
+            vec!["digital-paper-cli", "set-configuration", "./cfg.json"],
             vec!["digital-paper-cli", "set-datetime"],
             vec!["digital-paper-cli", "list-templates"],
             vec!["digital-paper-cli", "upload-template", "./template.pdf", "Template/template.pdf"],

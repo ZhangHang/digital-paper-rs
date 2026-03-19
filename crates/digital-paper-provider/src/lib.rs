@@ -1,7 +1,8 @@
 use anyhow::{anyhow, Result};
 use digital_paper_domain::{
     AdvancedCapabilities, BridgeError, BridgeErrorCode, ConnectionLog, DeviceStatus,
-    DeviceSummary, RemoteEntry, TransportKind, WifiNetwork,
+    DeviceSummary, RemoteEntry, TransportKind, UsbStatus, UsbSwitchMode, WifiConfigInput,
+    WifiNetwork,
 };
 use digital_paper_rust_provider::{RustNativeProvider, RustProviderError};
 use std::sync::Arc;
@@ -38,9 +39,11 @@ pub trait DptProvider: Send + Sync {
     fn list_wifi(&self) -> Result<Vec<WifiNetwork>>;
     fn scan_wifi(&self) -> Result<Vec<WifiNetwork>>;
     fn add_wifi(&self, ssid: String, security: String, passwd: String) -> Result<()>;
+    fn add_wifi_full(&self, config: WifiConfigInput) -> Result<()>;
     fn remove_wifi(&self, ssid: String, security: String) -> Result<()>;
     fn toggle_wifi(&self, enabled: bool) -> Result<()>;
     fn get_config(&self) -> Result<serde_json::Value>;
+    fn set_config(&self, config: serde_json::Value) -> Result<()>;
     fn get_config_value(&self, key: String) -> Result<serde_json::Value>;
     fn set_config_value(&self, key: String, value: serde_json::Value) -> Result<()>;
     fn set_datetime_now(&self) -> Result<()>;
@@ -51,7 +54,16 @@ pub trait DptProvider: Send + Sync {
     fn take_screenshot(&self) -> Result<Vec<u8>>;
     fn ping(&self) -> Result<bool>;
     fn update_firmware(&self, local_path: String) -> Result<()>;
-    fn sync_folder(&self, local_path: String, remote_path: String) -> Result<serde_json::Value>;
+    fn sync_folder(
+        &self,
+        local_path: String,
+        remote_path: String,
+        dry_run: bool,
+        assume_yes: bool,
+    ) -> Result<serde_json::Value>;
+    fn usb_status(&self) -> Result<UsbStatus>;
+    fn usb_switch_mode(&self, mode: UsbSwitchMode) -> Result<UsbStatus>;
+    fn usb_recover(&self) -> Result<UsbStatus>;
     fn import_credentials(
         &self,
         sony_app_folder: Option<String>,
@@ -202,6 +214,10 @@ impl DptProvider for RustOnlyProvider {
             .map_err(map_rust_error)
     }
 
+    fn add_wifi_full(&self, config: WifiConfigInput) -> Result<()> {
+        self.native.add_wifi_full(config).map_err(map_rust_error)
+    }
+
     fn remove_wifi(&self, ssid: String, security: String) -> Result<()> {
         self.native
             .remove_wifi(ssid, security)
@@ -214,6 +230,10 @@ impl DptProvider for RustOnlyProvider {
 
     fn get_config(&self) -> Result<serde_json::Value> {
         self.native.get_config().map_err(map_rust_error)
+    }
+
+    fn set_config(&self, config: serde_json::Value) -> Result<()> {
+        self.native.set_config(config).map_err(map_rust_error)
     }
 
     fn get_config_value(&self, key: String) -> Result<serde_json::Value> {
@@ -264,10 +284,28 @@ impl DptProvider for RustOnlyProvider {
         self.native.update_firmware(local_path).map_err(map_rust_error)
     }
 
-    fn sync_folder(&self, local_path: String, remote_path: String) -> Result<serde_json::Value> {
+    fn sync_folder(
+        &self,
+        local_path: String,
+        remote_path: String,
+        dry_run: bool,
+        assume_yes: bool,
+    ) -> Result<serde_json::Value> {
         self.native
-            .sync_folder(local_path, remote_path)
+            .sync_folder(local_path, remote_path, dry_run, assume_yes)
             .map_err(map_rust_error)
+    }
+
+    fn usb_status(&self) -> Result<UsbStatus> {
+        self.native.usb_status().map_err(map_rust_error)
+    }
+
+    fn usb_switch_mode(&self, mode: UsbSwitchMode) -> Result<UsbStatus> {
+        self.native.usb_switch_mode(mode).map_err(map_rust_error)
+    }
+
+    fn usb_recover(&self) -> Result<UsbStatus> {
+        self.native.usb_recover().map_err(map_rust_error)
     }
 
     fn import_credentials(

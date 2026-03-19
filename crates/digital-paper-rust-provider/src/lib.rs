@@ -1,7 +1,8 @@
 use base64::Engine;
 use digital_paper_domain::{
     AdvancedCapabilities, BatteryStatus, ConnectionLog, DeviceStatus, DeviceSummary, RemoteEntry,
-    RemoteEntryType, StorageStatus, TransportKind, WifiNetwork,
+    RemoteEntryType, StorageStatus, TransportKind, UsbStatus, UsbStatusKind, UsbSwitchMode,
+    WifiConfigInput, WifiNetwork, DEFAULT_DEVICE_HOST, USB_FALLBACK_ADDR,
 };
 use hmac::{Hmac, Mac};
 use num_bigint::BigUint;
@@ -103,6 +104,23 @@ struct ResolveEntry {
     entry_type: String,
 }
 
+#[derive(Debug, Clone)]
+struct ProbeInfo {
+    name: String,
+    serial: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct SyncCheckpoint {
+    files: HashMap<String, CheckpointEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CheckpointEntry {
+    local_mtime_secs: Option<u64>,
+    remote_modified_at: Option<String>,
+}
+
 pub struct RustNativeProvider {
     state: Mutex<RustState>,
 }
@@ -127,9 +145,9 @@ impl RustNativeProvider {
         self.log(format!("Discovery candidates: {}", addrs.join(", ")));
         let probes = probe_addrs_concurrently(&addrs, 24, Duration::from_millis(750));
         for addr in addrs {
-            let detected_name = probes.get(&addr).cloned().flatten();
+            let detected = probes.get(&addr).cloned().flatten();
             let is_usb = addr.starts_with("172.25.47.") || addr.starts_with("172.20.");
-            if let Some(detected_name) = detected_name {
+            if let Some(info) = detected {
                 let paired = match &credentials {
                     (Some(client_id), Some(private_key_pem)) => self
                         .authenticate_session(&addr, client_id.clone(), private_key_pem.clone())
@@ -138,8 +156,8 @@ impl RustNativeProvider {
                 };
                 devices.push(DeviceSummary {
                     id: format!("rust-{addr}"),
-                    serial: None,
-                    name: detected_name,
+                    serial: info.serial,
+                    name: info.name,
                     reachable_addrs: vec![addr.clone()],
                     transport_kinds: if is_usb {
                         vec![TransportKind::UsbNetwork, TransportKind::Wifi]
@@ -192,11 +210,18 @@ impl RustNativeProvider {
     pub fn connect(
         &self,
         addr: Option<String>,
-        _serial: Option<String>,
+        serial: Option<String>,
         transport_hint: Option<TransportKind>,
     ) -> std::result::Result<DeviceSummary, RustProviderError> {
         let target = if let Some(addr) = addr {
             addr
+        } else if let Some(serial) = serial {
+            let devices = self.discover_devices()?;
+            devices
+                .into_iter()
+                .find(|d| d.serial.as_deref() == Some(serial.as_str()))
+                .and_then(|d| d.reachable_addrs.first().cloned())
+                .ok_or(RustProviderError::DeviceNotFound)?
         } else {
             self.discover_devices()?
                 .into_iter()
@@ -205,7 +230,7 @@ impl RustNativeProvider {
                 .ok_or(RustProviderError::DeviceNotFound)?
         };
 
-        if !probe_addr(&target) && target != "digitalpaper.local" {
+        if !probe_addr(&target) && target != DEFAULT_DEVICE_HOST {
             return Err(RustProviderError::TransportUnreachable);
         }
 
@@ -223,7 +248,7 @@ impl RustNativeProvider {
         let device = DeviceSummary {
             id: format!("rust-{target}"),
             serial: None,
-            name: if target == "digitalpaper.local" {
+            name: if target == DEFAULT_DEVICE_HOST {
                 "Sony Digital Paper".to_string()
             } else {
                 format!("Sony Digital Paper ({target})")
@@ -276,7 +301,7 @@ impl RustNativeProvider {
         Ok(DeviceSummary {
             id: format!("rust-{addr}"),
             serial: None,
-            name: if addr == "digitalpaper.local" {
+            name: if addr == DEFAULT_DEVICE_HOST {
                 "Sony Digital Paper".to_string()
             } else {
                 format!("Sony Digital Paper ({addr})")
@@ -421,7 +446,10 @@ impl RustNativeProvider {
             ));
         }
         let bytes = self.get_bytes(&session, &format!("/documents/{}/file", object.entry_id))?;
-        let local = PathBuf::from(&local_path);
+        let mut local = PathBuf::from(&local_path);
+        if local.is_dir() {
+            local = local.join(basename(&remote_path));
+        }
         if let Some(parent) = local.parent() {
             if !parent.as_os_str().is_empty() {
                 fs::create_dir_all(parent).map_err(|e| {
@@ -722,21 +750,36 @@ impl RustNativeProvider {
         security: String,
         passwd: String,
     ) -> std::result::Result<(), RustProviderError> {
+        self.add_wifi_full(WifiConfigInput {
+            ssid,
+            security,
+            passwd,
+            dhcp: "true".to_string(),
+            static_address: String::new(),
+            gateway: String::new(),
+            network_mask: String::new(),
+            dns1: String::new(),
+            dns2: String::new(),
+            proxy: "false".to_string(),
+        })
+    }
+
+    pub fn add_wifi_full(&self, config: WifiConfigInput) -> std::result::Result<(), RustProviderError> {
         let session = self.require_session()?;
         self.put_json(
             &session,
             "/system/controls/wifi_accesspoints/register",
             &json!({
-                "ssid": base64::engine::general_purpose::STANDARD.encode(ssid.as_bytes()),
-                "security": security,
-                "passwd": passwd,
-                "dhcp": "true",
-                "static_address": "",
-                "gateway": "",
-                "network_mask": "",
-                "dns1": "",
-                "dns2": "",
-                "proxy": "false"
+                "ssid": base64::engine::general_purpose::STANDARD.encode(config.ssid.as_bytes()),
+                "security": config.security,
+                "passwd": config.passwd,
+                "dhcp": config.dhcp,
+                "static_address": config.static_address,
+                "gateway": config.gateway,
+                "network_mask": config.network_mask,
+                "dns1": config.dns1,
+                "dns2": config.dns2,
+                "proxy": config.proxy
             }),
         )?;
         self.log("Wi-Fi network added".into());
@@ -768,6 +811,18 @@ impl RustNativeProvider {
     pub fn get_config(&self) -> std::result::Result<Value, RustProviderError> {
         let session = self.require_session()?;
         self.get_json(&session, "/system/configs/")
+    }
+
+    pub fn set_config(&self, config: Value) -> std::result::Result<(), RustProviderError> {
+        let session = self.require_session()?;
+        let object = config.as_object().ok_or_else(|| {
+            RustProviderError::Internal("configuration payload must be a JSON object".into())
+        })?;
+        for (key, value) in object {
+            self.put_json(&session, &format!("/system/configs/{key}"), value)?;
+        }
+        self.log("Device configuration updated".into());
+        Ok(())
     }
 
     pub fn get_config_value(&self, key: &str) -> std::result::Result<Value, RustProviderError> {
@@ -911,63 +966,206 @@ impl RustNativeProvider {
         &self,
         local_path: String,
         remote_path: String,
+        dry_run: bool,
+        _assume_yes: bool,
     ) -> std::result::Result<serde_json::Value, RustProviderError> {
         let session = self.require_session()?;
+        let _ = self.set_datetime_now();
         self.new_folder(&session, &remote_path)?;
-        let all_remote = self
-            .get_json(
-                &session,
-                "/documents2?entry_type=all&fields=entry_path,entry_type,modified_date,file_size",
-            )?
-            .get("entry_list")
-            .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default();
-        let remote_docs: std::collections::HashSet<String> = all_remote
-            .into_iter()
-            .filter_map(|v| {
-                let ty = v.get("entry_type").and_then(Value::as_str).unwrap_or("");
-                if ty != "document" {
-                    return None;
-                }
-                v.get("entry_path")
-                    .and_then(Value::as_str)
-                    .map(ToOwned::to_owned)
-            })
-            .collect();
 
-        let mut uploaded = Vec::new();
-        let mut skipped = Vec::new();
+        let remote_docs = self.remote_documents(&session, &remote_path)?;
+        let local_docs = local_documents(&local_path, &remote_path)?;
+        let checkpoint_path = sync_checkpoint_path(&local_path);
+        let checkpoint = read_sync_checkpoint(&checkpoint_path);
+
+        let mut all_paths: BTreeSet<String> = BTreeSet::new();
+        all_paths.extend(remote_docs.keys().cloned());
+        all_paths.extend(local_docs.keys().cloned());
+        all_paths.extend(checkpoint.files.keys().cloned());
+
+        let mut to_upload = Vec::new();
+        let mut to_download = Vec::new();
+        let mut to_delete_remote = Vec::new();
+        let mut to_delete_local = Vec::new();
         let mut conflicts = Vec::new();
-        for entry in WalkDir::new(&local_path)
-            .into_iter()
-            .filter_map(|v| v.ok())
-            .filter(|v| v.file_type().is_file())
-        {
-            let rel = entry.path().strip_prefix(&local_path).map_err(|e| {
-                RustProviderError::Internal(format!("sync relative path failed: {e}"))
-            })?;
-            let rel = rel.to_string_lossy().replace('\\', "/");
-            let remote_target = format!("{}/{}", remote_path.trim_end_matches('/'), rel);
-            if remote_docs.contains(&remote_target) {
-                skipped.push(remote_target.clone());
-                conflicts.push(remote_target);
+
+        for path in all_paths {
+            let local = local_docs.get(&path);
+            let remote = remote_docs.get(&path);
+            let prev = checkpoint.files.get(&path);
+
+            if prev.is_none() {
+                match (local, remote) {
+                    (Some(_), None) => to_upload.push(path),
+                    (None, Some(_)) => to_download.push(path),
+                    (Some(_), Some(_)) => conflicts.push(path),
+                    (None, None) => {}
+                }
                 continue;
             }
-            self.upload(
-                entry.path().to_string_lossy().to_string(),
-                remote_target.clone(),
+
+            let prev = prev.expect("checked above");
+            let local_changed = local.map(|v| v.mtime_secs) != prev.local_mtime_secs;
+            let remote_changed =
+                remote.and_then(|v| v.modified_at.clone()) != prev.remote_modified_at;
+
+            match (local, remote) {
+                (Some(local_meta), Some(remote_meta)) => {
+                    if local_changed && remote_changed {
+                        conflicts.push(path.clone());
+                        let remote_secs = remote_meta
+                            .modified_at
+                            .as_deref()
+                            .and_then(parse_rfc3339_utc_seconds)
+                            .unwrap_or(0);
+                        if local_meta.mtime_secs >= remote_secs {
+                            to_upload.push(path);
+                        } else {
+                            to_download.push(path);
+                        }
+                    } else if local_changed {
+                        to_upload.push(path);
+                    } else if remote_changed {
+                        to_download.push(path);
+                    }
+                }
+                (Some(_), None) => {
+                    if prev.remote_modified_at.is_some() {
+                        if local_changed {
+                            to_upload.push(path);
+                        } else {
+                            to_delete_local.push(path);
+                        }
+                    } else {
+                        to_upload.push(path);
+                    }
+                }
+                (None, Some(_)) => {
+                    if prev.local_mtime_secs.is_some() {
+                        if remote_changed {
+                            to_download.push(path);
+                        } else {
+                            to_delete_remote.push(path);
+                        }
+                    } else {
+                        to_download.push(path);
+                    }
+                }
+                (None, None) => {}
+            }
+        }
+
+        let mut downloaded = Vec::new();
+        let mut uploaded = Vec::new();
+        let mut deleted_remote = Vec::new();
+        let mut deleted_local = Vec::new();
+
+        if !dry_run {
+            for path in &to_download {
+                let local_target = local_target_path(&local_path, &remote_path, path)?;
+                self.download(path.clone(), local_target.to_string_lossy().to_string())?;
+                downloaded.push(path.clone());
+            }
+            for path in &to_delete_local {
+                let local_target = local_target_path(&local_path, &remote_path, path)?;
+                if local_target.exists() {
+                    fs::remove_file(&local_target).map_err(|e| {
+                        RustProviderError::Internal(format!("remove local file failed: {e}"))
+                    })?;
+                }
+                deleted_local.push(path.clone());
+            }
+            for path in &to_upload {
+                if let Some(local_meta) = local_docs.get(path) {
+                    self.upload(local_meta.path.to_string_lossy().to_string(), path.clone())?;
+                    uploaded.push(path.clone());
+                }
+            }
+            for path in &to_delete_remote {
+                if self.path_exists(path.clone())? {
+                    self.delete(path.clone())?;
+                }
+                deleted_remote.push(path.clone());
+            }
+
+            let refreshed_remote = self.remote_documents(&session, &remote_path)?;
+            let refreshed_local = local_documents(&local_path, &remote_path)?;
+            write_sync_checkpoint(
+                &checkpoint_path,
+                build_sync_checkpoint(&refreshed_local, &refreshed_remote),
             )?;
-            uploaded.push(remote_target);
         }
 
         let result = json!({
-            "uploaded": uploaded,
-            "skipped": skipped,
+            "dryRun": dry_run,
+            "download": if dry_run { to_download } else { downloaded },
+            "upload": if dry_run { to_upload } else { uploaded },
+            "deleteRemote": if dry_run { to_delete_remote } else { deleted_remote },
+            "deleteLocal": if dry_run { to_delete_local } else { deleted_local },
             "conflicts": conflicts
         });
-        self.log("Sync completed".into());
+        self.log("Sync completed with bidirectional checkpoint mode".into());
         Ok(result)
+    }
+
+    pub fn usb_status(&self) -> std::result::Result<UsbStatus, RustProviderError> {
+        usb_status_inner()
+    }
+
+    pub fn usb_switch_mode(
+        &self,
+        mode: UsbSwitchMode,
+    ) -> std::result::Result<UsbStatus, RustProviderError> {
+        if !cfg!(target_os = "macos") {
+            return Err(RustProviderError::UnsupportedOverUsb);
+        }
+        let ttys = usb_serial_ttys()?;
+        if ttys.is_empty() {
+            return Ok(UsbStatus {
+                kind: UsbStatusKind::NoUsbHardware,
+                tty_paths: Vec::new(),
+                iface_names: Vec::new(),
+                candidate_addrs: Vec::new(),
+                endpoint_addr: None,
+                message: "No USB serial endpoint found for Digital Paper.".into(),
+            });
+        }
+        let modes: Vec<UsbSwitchMode> = match mode {
+            UsbSwitchMode::Auto => vec![UsbSwitchMode::Ecm, UsbSwitchMode::Rndis],
+            other => vec![other],
+        };
+        for m in modes {
+            let bytes: &[u8] = match m {
+                UsbSwitchMode::Ecm => &[0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x01, 0x04],
+                UsbSwitchMode::Rndis => &[0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x04],
+                UsbSwitchMode::Auto => continue,
+            };
+            for tty in &ttys {
+                let _ = write_usb_mode_bytes(tty, bytes);
+            }
+            thread::sleep(Duration::from_millis(900));
+            let status = usb_status_inner()?;
+            if matches!(status.kind, UsbStatusKind::UsbNetworkVisible | UsbStatusKind::DptEndpointReachable)
+            {
+                return Ok(status);
+            }
+        }
+        usb_status_inner()
+    }
+
+    pub fn usb_recover(&self) -> std::result::Result<UsbStatus, RustProviderError> {
+        let status = self.usb_status()?;
+        if matches!(status.kind, UsbStatusKind::DptEndpointReachable) {
+            return Ok(status);
+        }
+        if matches!(status.kind, UsbStatusKind::UsbSerialOnly) {
+            let switched = self.usb_switch_mode(UsbSwitchMode::Auto)?;
+            if let Some(addr) = switched.endpoint_addr.clone() {
+                let _ = self.connect(Some(addr), None, Some(TransportKind::UsbNetwork));
+            }
+            return Ok(switched);
+        }
+        Ok(status)
     }
 
     pub fn import_credentials(
@@ -1000,7 +1198,7 @@ impl RustNativeProvider {
             .lock()
             .selected_addr
             .clone()
-            .unwrap_or_else(|| "digitalpaper.local".to_string());
+            .unwrap_or_else(|| DEFAULT_DEVICE_HOST.to_string());
         self.connect(Some(addr), None, None)
     }
 
@@ -1040,6 +1238,46 @@ impl RustNativeProvider {
         }
         drop(state);
         append_debug_log("provider", &message);
+    }
+
+    fn remote_documents(
+        &self,
+        session: &RustSession,
+        remote_root: &str,
+    ) -> std::result::Result<HashMap<String, RemoteDocMeta>, RustProviderError> {
+        let value = self.get_json(
+            session,
+            "/documents2?entry_type=all&fields=entry_path,entry_type,modified_date,file_size",
+        )?;
+        let entries = value
+            .get("entry_list")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let mut out = HashMap::new();
+        let prefix = format!("{}/", remote_root.trim_end_matches('/'));
+        for entry in entries {
+            let ty = entry.get("entry_type").and_then(Value::as_str).unwrap_or("");
+            if ty != "document" {
+                continue;
+            }
+            let Some(path) = entry.get("entry_path").and_then(Value::as_str) else {
+                continue;
+            };
+            if path != remote_root && !path.starts_with(&prefix) {
+                continue;
+            }
+            out.insert(
+                path.to_string(),
+                RemoteDocMeta {
+                    modified_at: entry
+                        .get("modified_date")
+                        .and_then(Value::as_str)
+                        .map(ToOwned::to_owned),
+                },
+            );
+        }
+        Ok(out)
     }
 
     fn require_session(&self) -> std::result::Result<RustSession, RustProviderError> {
@@ -1107,6 +1345,7 @@ impl RustNativeProvider {
             .http1_only()
             .cookie_store(true)
             .danger_accept_invalid_certs(true)
+            .no_proxy()
             .timeout(Duration::from_secs(30))
             .build()
             .map_err(|e| RustProviderError::Internal(format!("http client build failed: {e}")))?;
@@ -1180,6 +1419,7 @@ impl RustNativeProvider {
             .http1_only()
             .cookie_store(true)
             .danger_accept_invalid_certs(true)
+            .no_proxy()
             .timeout(Duration::from_secs(30))
             .build()
             .map_err(|e| RustProviderError::Internal(format!("http client build failed: {e}")))?;
@@ -1455,7 +1695,7 @@ impl RustNativeProvider {
         if let Some(addr) = self.state.lock().selected_addr.clone() {
             return Ok(addr);
         }
-        Ok("digitalpaper.local".to_string())
+        Ok(DEFAULT_DEVICE_HOST.to_string())
     }
 
     fn registration_client(
@@ -1465,6 +1705,7 @@ impl RustNativeProvider {
         Client::builder()
             .http1_only()
             .danger_accept_invalid_certs(true)
+            .no_proxy()
             .timeout(timeout)
             .build()
             .map_err(|e| RustProviderError::Internal(format!("http client build failed: {e}")))
@@ -1818,6 +2059,346 @@ fn map_status_error(err: reqwest::Error) -> RustProviderError {
     RustProviderError::Internal(format!("http request failed: {err}"))
 }
 
+#[derive(Debug, Clone)]
+struct LocalDocMeta {
+    path: PathBuf,
+    mtime_secs: u64,
+}
+
+#[derive(Debug, Clone)]
+struct RemoteDocMeta {
+    modified_at: Option<String>,
+}
+
+fn local_documents(
+    local_root: &str,
+    remote_root: &str,
+) -> std::result::Result<HashMap<String, LocalDocMeta>, RustProviderError> {
+    let root = PathBuf::from(local_root);
+    let mut out = HashMap::new();
+    for entry in WalkDir::new(&root).into_iter().filter_map(|e| e.ok()) {
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let ext = entry
+            .path()
+            .extension()
+            .and_then(|v| v.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        if ext != "pdf" {
+            continue;
+        }
+        let rel = entry.path().strip_prefix(&root).map_err(|e| {
+            RustProviderError::Internal(format!("sync relative path failed: {e}"))
+        })?;
+        let rel = rel.to_string_lossy().replace('\\', "/");
+        let remote_path = format!("{}/{}", remote_root.trim_end_matches('/'), rel);
+        let metadata = fs::metadata(entry.path())
+            .map_err(|e| RustProviderError::Internal(format!("read metadata failed: {e}")))?;
+        let mtime_secs = metadata
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        out.insert(
+            remote_path,
+            LocalDocMeta {
+                path: entry.path().to_path_buf(),
+                mtime_secs,
+            },
+        );
+    }
+    Ok(out)
+}
+
+fn sync_checkpoint_path(local_root: &str) -> PathBuf {
+    PathBuf::from(local_root).join(".sync")
+}
+
+fn read_sync_checkpoint(path: &PathBuf) -> SyncCheckpoint {
+    let Ok(text) = fs::read_to_string(path) else {
+        return SyncCheckpoint::default();
+    };
+    serde_json::from_str(&text).unwrap_or_default()
+}
+
+fn write_sync_checkpoint(
+    path: &PathBuf,
+    checkpoint: SyncCheckpoint,
+) -> std::result::Result<(), RustProviderError> {
+    let text = serde_json::to_string_pretty(&checkpoint)
+        .map_err(|e| RustProviderError::Internal(format!("checkpoint serialize failed: {e}")))?;
+    fs::write(path, text)
+        .map_err(|e| RustProviderError::Internal(format!("checkpoint write failed: {e}")))?;
+    Ok(())
+}
+
+fn build_sync_checkpoint(
+    local_docs: &HashMap<String, LocalDocMeta>,
+    remote_docs: &HashMap<String, RemoteDocMeta>,
+) -> SyncCheckpoint {
+    let mut files = HashMap::new();
+    let mut all: BTreeSet<String> = BTreeSet::new();
+    all.extend(local_docs.keys().cloned());
+    all.extend(remote_docs.keys().cloned());
+    for path in all {
+        files.insert(
+            path.clone(),
+            CheckpointEntry {
+                local_mtime_secs: local_docs.get(&path).map(|v| v.mtime_secs),
+                remote_modified_at: remote_docs.get(&path).and_then(|v| v.modified_at.clone()),
+            },
+        );
+    }
+    SyncCheckpoint { files }
+}
+
+fn local_target_path(
+    local_root: &str,
+    remote_root: &str,
+    remote_path: &str,
+) -> std::result::Result<PathBuf, RustProviderError> {
+    let prefix = format!("{}/", remote_root.trim_end_matches('/'));
+    let rel = if remote_path.starts_with(&prefix) {
+        &remote_path[prefix.len()..]
+    } else if remote_path == remote_root {
+        basename(remote_path)
+    } else {
+        return Err(RustProviderError::Internal(format!(
+            "remote path {remote_path} not under sync root {remote_root}"
+        )));
+    };
+    Ok(PathBuf::from(local_root).join(rel))
+}
+
+fn parse_rfc3339_utc_seconds(value: &str) -> Option<u64> {
+    // Expected format: YYYY-MM-DDTHH:MM:SSZ
+    if value.len() < 20 || !value.ends_with('Z') {
+        return None;
+    }
+    let year: i32 = value.get(0..4)?.parse().ok()?;
+    let month: u32 = value.get(5..7)?.parse().ok()?;
+    let day: u32 = value.get(8..10)?.parse().ok()?;
+    let hour: u32 = value.get(11..13)?.parse().ok()?;
+    let min: u32 = value.get(14..16)?.parse().ok()?;
+    let sec: u32 = value.get(17..19)?.parse().ok()?;
+    let days = days_from_civil(year, month, day)?;
+    Some(days * 86_400 + (hour as u64) * 3_600 + (min as u64) * 60 + sec as u64)
+}
+
+fn days_from_civil(year: i32, month: u32, day: u32) -> Option<u64> {
+    if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+        return None;
+    }
+    let y = year - (month <= 2) as i32;
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = (y - era * 400) as u32;
+    let doy = (153 * (month + if month > 2 { 9 } else { 21 }) + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = (era * 146097 + doe as i32 - 719468) as i64;
+    if days < 0 {
+        None
+    } else {
+        Some(days as u64)
+    }
+}
+
+fn usb_status_inner() -> std::result::Result<UsbStatus, RustProviderError> {
+    let tty_paths = usb_serial_ttys()?;
+    let (iface_names, mut candidates) = usb_network_candidates();
+    for fallback in fallback_device_addrs() {
+        candidates.push((*fallback).to_string());
+    }
+    candidates.push(DEFAULT_DEVICE_HOST.to_string());
+    candidates.sort();
+    candidates.dedup();
+    let routed = filter_candidates_by_usb_route(&candidates, &iface_names);
+    if !routed.filtered.is_empty() {
+        candidates = routed.filtered;
+    }
+    if candidates.len() > 10 {
+        let preferred = [USB_FALLBACK_ADDR, DEFAULT_DEVICE_HOST];
+        let mut trimmed = Vec::new();
+        for p in preferred {
+            if candidates.iter().any(|c| c == p) {
+                trimmed.push(p.to_string());
+            }
+        }
+        for c in &candidates {
+            if trimmed.len() >= 10 {
+                break;
+            }
+            if !trimmed.contains(c) {
+                trimmed.push(c.clone());
+            }
+        }
+        candidates = trimmed;
+    }
+    if tty_paths.is_empty() && iface_names.is_empty() {
+        return Ok(UsbStatus {
+            kind: UsbStatusKind::NoUsbHardware,
+            tty_paths,
+            iface_names,
+            candidate_addrs: candidates,
+            endpoint_addr: None,
+            message: "No Digital Paper USB endpoint detected.".into(),
+        });
+    }
+    for addr in &candidates {
+        if probe_dpt_info(addr, Duration::from_millis(1100)).is_some() {
+            return Ok(UsbStatus {
+                kind: UsbStatusKind::DptEndpointReachable,
+                tty_paths,
+                iface_names,
+                candidate_addrs: candidates.clone(),
+                endpoint_addr: Some(addr.clone()),
+                message: format!("Digital Paper endpoint reachable over USB at {addr}."),
+            });
+        }
+    }
+    if !iface_names.is_empty() {
+        let mut message =
+            "USB network interface is visible but DPT endpoint is not responding.".to_string();
+        if !routed.mismatches.is_empty() {
+            let details = routed
+                .mismatches
+                .iter()
+                .take(3)
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+                .join(", ");
+            message = format!(
+                "USB network interface is visible, but routes are not using USB ({details})."
+            );
+        }
+        return Ok(UsbStatus {
+            kind: UsbStatusKind::UsbNetworkVisible,
+            tty_paths,
+            iface_names,
+            candidate_addrs: candidates,
+            endpoint_addr: None,
+            message,
+        });
+    }
+    Ok(UsbStatus {
+        kind: UsbStatusKind::UsbSerialOnly,
+        tty_paths,
+        iface_names,
+        candidate_addrs: candidates,
+        endpoint_addr: None,
+        message: "USB serial endpoint detected; network interface not active yet.".into(),
+    })
+}
+
+fn usb_serial_ttys() -> std::result::Result<Vec<String>, RustProviderError> {
+    let mut out = Vec::new();
+    for base in ["/dev/tty.", "/dev/cu."] {
+        let dir = PathBuf::from("/dev");
+        let read = fs::read_dir(&dir)
+            .map_err(|e| RustProviderError::Internal(format!("read /dev failed: {e}")))?;
+        for entry in read.filter_map(|e| e.ok()) {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if !name.starts_with(&base[5..]) {
+                continue;
+            }
+            let lower = name.to_ascii_lowercase();
+            if lower.contains("usbmodem") || lower.contains("ttyacm") {
+                out.push(format!("/dev/{name}"));
+            }
+        }
+    }
+    out.sort();
+    out.dedup();
+    Ok(out)
+}
+
+fn write_usb_mode_bytes(path: &str, bytes: &[u8]) -> std::result::Result<(), RustProviderError> {
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .open(path)
+        .map_err(|e| RustProviderError::Internal(format!("open {path} failed: {e}")))?;
+    file.write_all(bytes)
+        .map_err(|e| RustProviderError::Internal(format!("write {path} failed: {e}")))?;
+    file.flush()
+        .map_err(|e| RustProviderError::Internal(format!("flush {path} failed: {e}")))?;
+    Ok(())
+}
+
+fn usb_network_candidates() -> (Vec<String>, Vec<String>) {
+    let Ok(ifaces) = if_addrs::get_if_addrs() else {
+        return (Vec::new(), Vec::new());
+    };
+    let mut iface_names = Vec::new();
+    let mut candidates = Vec::new();
+    for iface in ifaces {
+        let lower = iface.name.to_ascii_lowercase();
+        let looks_usb = (lower.starts_with("en") && lower != "en0")
+            || lower.starts_with("usb")
+            || lower.starts_with("eth")
+            || lower.starts_with("rndis")
+            || lower.starts_with("ecm");
+        if !looks_usb {
+            continue;
+        }
+        let (ip, netmask) = match iface.addr {
+            if_addrs::IfAddr::V4(v4) => (v4.ip, v4.netmask),
+            if_addrs::IfAddr::V6(_) => continue,
+        };
+        iface_names.push(iface.name.clone());
+        if let Some(mut c) = usb_probe_candidates(ip, netmask) {
+            candidates.append(&mut c);
+        }
+    }
+    candidates.sort();
+    candidates.dedup();
+    iface_names.sort();
+    iface_names.dedup();
+    (iface_names, candidates)
+}
+
+fn usb_probe_candidates(ip: Ipv4Addr, netmask: Ipv4Addr) -> Option<Vec<String>> {
+    if ip.is_loopback() {
+        return None;
+    }
+    let oct = ip.octets();
+    let is_private = oct[0] == 10
+        || (oct[0] == 172 && (16..=31).contains(&oct[1]))
+        || (oct[0] == 192 && oct[1] == 168);
+    let is_link_local = oct[0] == 169 && oct[1] == 254;
+    if !is_private && !is_link_local {
+        return None;
+    }
+    let ip_u32 = u32::from(ip);
+    let mask_u32 = u32::from(netmask);
+    let network = ip_u32 & mask_u32;
+    let broadcast = network | !mask_u32;
+    let host_count = broadcast.saturating_sub(network).saturating_sub(1);
+    let mut candidates = Vec::new();
+    if host_count <= 64 {
+        for host in (network.saturating_add(1))..broadcast {
+            if host == ip_u32 {
+                continue;
+            }
+            candidates.push(Ipv4Addr::from(host).to_string());
+        }
+    } else {
+        for host in [1_u8, 2, 10, 20, 30, 47, 50, 80, 92, 100, 110, 150, 200, 254] {
+            if host == oct[3] {
+                continue;
+            }
+            let candidate = Ipv4Addr::new(oct[0], oct[1], oct[2], host);
+            let candidate_u32 = u32::from(candidate);
+            if candidate_u32 <= network || candidate_u32 >= broadcast {
+                continue;
+            }
+            candidates.push(candidate.to_string());
+        }
+    }
+    Some(candidates)
+}
+
 fn find_credentials_in_folder(
     folder: PathBuf,
 ) -> std::result::Result<(PathBuf, PathBuf), RustProviderError> {
@@ -1872,7 +2453,7 @@ fn candidate_addrs() -> Vec<String> {
     for addr in fallback_device_addrs() {
         values.insert((*addr).to_string());
     }
-    values.insert("digitalpaper.local".into());
+    values.insert(DEFAULT_DEVICE_HOST.into());
     for addr in lan_probe_candidates() {
         values.insert(addr);
     }
@@ -1880,7 +2461,7 @@ fn candidate_addrs() -> Vec<String> {
 }
 
 fn fallback_device_addrs() -> &'static [&'static str] {
-    &["172.25.47.1"]
+    &[USB_FALLBACK_ADDR]
 }
 
 fn filtered_known_addrs() -> Vec<String> {
@@ -2030,8 +2611,17 @@ fn is_private_ipv4(ip: Ipv4Addr) -> bool {
 }
 
 fn read_credentials_files() -> Option<(Option<String>, Option<String>)> {
-    let device_id = read_trimmed(default_device_id_path()).ok();
-    let private_key = read_trimmed(default_private_key_path()).ok();
+    let mut device_id = read_trimmed(default_device_id_path()).ok();
+    let mut private_key = read_trimmed(default_private_key_path()).ok();
+    if device_id.is_none() || private_key.is_none() {
+        if let Ok((device, key)) = find_credentials_in_folder(sony_app_config_dir()) {
+            device_id = device_id.or_else(|| read_trimmed(device).ok());
+            private_key = private_key.or_else(|| read_trimmed(key).ok());
+        } else {
+            device_id = device_id.or_else(|| read_trimmed(sony_device_id_path()).ok());
+            private_key = private_key.or_else(|| read_trimmed(sony_private_key_path()).ok());
+        }
+    }
     Some((device_id, private_key))
 }
 
@@ -2045,6 +2635,21 @@ fn default_private_key_path() -> PathBuf {
 
 fn pending_pairing_path() -> PathBuf {
     home_config_dir().join("pending_pairing.json")
+}
+
+fn sony_app_config_dir() -> PathBuf {
+    std::env::var("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("."))
+        .join("Library/Application Support/Sony Corporation/Digital Paper App")
+}
+
+fn sony_device_id_path() -> PathBuf {
+    sony_app_config_dir().join("deviceid.dat")
+}
+
+fn sony_private_key_path() -> PathBuf {
+    sony_app_config_dir().join("privatekey.dat")
 }
 
 fn home_config_dir() -> PathBuf {
@@ -2086,6 +2691,7 @@ fn read_pending_pairing() -> std::result::Result<Option<PendingPairing>, RustPro
         .http1_only()
         .cookie_store(true)
         .danger_accept_invalid_certs(true)
+        .no_proxy()
         .timeout(Duration::from_secs(30))
         .build()
         .map_err(|e| RustProviderError::Internal(format!("http client build failed: {e}")))?;
@@ -2119,14 +2725,14 @@ fn read_trimmed(path: PathBuf) -> std::io::Result<String> {
 }
 
 fn probe_addr(addr: &str) -> bool {
-    probe_dpt_name(addr, Duration::from_millis(500)).is_some()
+    probe_dpt_info(addr, Duration::from_millis(500)).is_some()
 }
 
 fn probe_addrs_concurrently(
     addrs: &[String],
     max_workers: usize,
     timeout: Duration,
-) -> HashMap<String, Option<String>> {
+) -> HashMap<String, Option<ProbeInfo>> {
     if addrs.is_empty() {
         return HashMap::new();
     }
@@ -2135,7 +2741,7 @@ fn probe_addrs_concurrently(
     let queue = Arc::new(Mutex::new(
         addrs.iter().cloned().collect::<VecDeque<String>>(),
     ));
-    let (tx, rx) = mpsc::channel::<(String, Option<String>)>();
+    let (tx, rx) = mpsc::channel::<(String, Option<ProbeInfo>)>();
     let mut handles = Vec::with_capacity(workers);
 
     for _ in 0..workers {
@@ -2149,8 +2755,8 @@ fn probe_addrs_concurrently(
             let Some(addr) = next else {
                 return;
             };
-            let detected_name = probe_addr_with_timeout(&addr, timeout);
-            let _ = tx.send((addr, detected_name));
+            let detected = probe_addr_with_timeout(&addr, timeout);
+            let _ = tx.send((addr, detected));
         }));
     }
     drop(tx);
@@ -2165,14 +2771,15 @@ fn probe_addrs_concurrently(
     out
 }
 
-fn probe_addr_with_timeout(addr: &str, timeout: Duration) -> Option<String> {
-    probe_dpt_name(addr, timeout)
+fn probe_addr_with_timeout(addr: &str, timeout: Duration) -> Option<ProbeInfo> {
+    probe_dpt_info(addr, timeout)
 }
 
-fn probe_dpt_name(addr: &str, timeout: Duration) -> Option<String> {
+fn probe_dpt_info(addr: &str, timeout: Duration) -> Option<ProbeInfo> {
     let client = Client::builder()
         .http1_only()
         .danger_accept_invalid_certs(true)
+        .no_proxy()
         .timeout(timeout)
         .build()
         .map_err(|err| {
@@ -2183,11 +2790,31 @@ fn probe_dpt_name(addr: &str, timeout: Duration) -> Option<String> {
     let response = client
         .get(format!("http://{addr}:8080/register/information"))
         .send()
-        .map_err(|err| {
-            append_debug_log("probe", &format!("register/information request failed for {addr}: {err}"));
-            err
-        })
-        .ok()?;
+        .ok();
+    let Some(response) = response else {
+        // Fallback probe: some states still answer /api_version even when info endpoint is flaky.
+        if let Ok(api_resp) = client.get(format!("http://{addr}:8080/api_version")).send() {
+            if api_resp.status().is_success() {
+                append_debug_log(
+                    "probe",
+                    &format!("Detected endpoint via api_version fallback for {addr}"),
+                );
+                return Some(ProbeInfo {
+                    name: if addr == DEFAULT_DEVICE_HOST {
+                        "Sony Digital Paper".to_string()
+                    } else {
+                        format!("Sony Digital Paper ({addr})")
+                    },
+                    serial: None,
+                });
+            }
+        }
+        append_debug_log(
+            "probe",
+            &format!("register/information request failed for {addr}"),
+        );
+        return None;
+    };
     if !response.status().is_success() {
         append_debug_log(
             "probe",
@@ -2221,10 +2848,18 @@ fn probe_dpt_name(addr: &str, timeout: Duration) -> Option<String> {
         "probe",
         &format!("Detected DPT response from {addr}: model={model_name} serial={serial}"),
     );
-    Some(if addr == "digitalpaper.local" {
+    let display_name = if addr == DEFAULT_DEVICE_HOST {
         model_name.to_string()
     } else {
         format!("{model_name} ({addr})")
+    };
+    Some(ProbeInfo {
+        name: display_name,
+        serial: if serial.is_empty() {
+            None
+        } else {
+            Some(serial.to_string())
+        },
     })
 }
 
@@ -2252,6 +2887,68 @@ fn append_debug_log(component: &str, message: &str) {
 
 fn debug_log_path() -> PathBuf {
     home_config_dir().join("debug.log")
+}
+
+#[derive(Default)]
+struct RoutedCandidates {
+    filtered: Vec<String>,
+    mismatches: Vec<String>,
+}
+
+fn filter_candidates_by_usb_route(candidates: &[String], iface_names: &[String]) -> RoutedCandidates {
+    if iface_names.is_empty() {
+        return RoutedCandidates {
+            filtered: candidates.to_vec(),
+            mismatches: Vec::new(),
+        };
+    }
+    let usb_ifaces: BTreeSet<String> = iface_names.iter().cloned().collect();
+    let mut filtered = Vec::new();
+    let mut mismatches = Vec::new();
+    for addr in candidates {
+        if addr == DEFAULT_DEVICE_HOST {
+            filtered.push(addr.clone());
+            continue;
+        }
+        let Some(route_iface) = route_interface_for_addr(addr) else {
+            filtered.push(addr.clone());
+            continue;
+        };
+        if usb_ifaces.contains(&route_iface) {
+            filtered.push(addr.clone());
+        } else {
+            mismatches.push(format!("{addr}->{route_iface}"));
+            append_debug_log(
+                "usb",
+                &format!("Skipping USB probe target {addr}; route uses non-USB iface {route_iface}"),
+            );
+        }
+    }
+    RoutedCandidates { filtered, mismatches }
+}
+
+fn route_interface_for_addr(addr: &str) -> Option<String> {
+    if addr.parse::<Ipv4Addr>().is_err() {
+        return None;
+    }
+    let output = std::process::Command::new("route")
+        .args(["-n", "get", addr])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8(output.stdout).ok()?;
+    for line in stdout.lines() {
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix("interface:") {
+            let iface = rest.trim();
+            if !iface.is_empty() {
+                return Some(iface.to_string());
+            }
+        }
+    }
+    None
 }
 
 fn chrono_like_now_utc() -> String {
@@ -2400,7 +3097,7 @@ fn map_remote_entry(entry: &Value) -> RemoteEntry {
 mod tests {
     use super::{
         fallback_device_addrs, parse_credentials_cookie, quote_plus, read_known_addrs,
-        save_known_addrs,
+        save_known_addrs, DEFAULT_DEVICE_HOST, USB_FALLBACK_ADDR,
     };
     use std::sync::Mutex;
     use std::{env, fs};
@@ -2422,6 +3119,7 @@ mod tests {
 
     #[test]
     fn known_addr_persistence_roundtrip() {
+        const SAMPLE_WIFI_ADDR: &str = "192.168.1.92";
         let _guard = HOME_TEST_LOCK.lock().expect("lock home test");
         let temp_home = env::temp_dir().join(format!(
             "digital-paper-rust-provider-test-{}",
@@ -2436,11 +3134,11 @@ mod tests {
             env::set_var("HOME", &temp_home);
         }
 
-        save_known_addrs(["192.168.1.92".to_string(), "digitalpaper.local".to_string()])
+        save_known_addrs([SAMPLE_WIFI_ADDR.to_string(), DEFAULT_DEVICE_HOST.to_string()])
             .expect("save known addrs");
         let known = read_known_addrs();
-        assert!(known.iter().any(|a| a == "192.168.1.92"));
-        assert!(known.iter().any(|a| a == "digitalpaper.local"));
+        assert!(known.iter().any(|a| a == SAMPLE_WIFI_ADDR));
+        assert!(known.iter().any(|a| a == DEFAULT_DEVICE_HOST));
 
         if let Some(prev) = prev {
             unsafe {
@@ -2456,6 +3154,6 @@ mod tests {
 
     #[test]
     fn fallback_addrs_include_python_usb_target() {
-        assert!(fallback_device_addrs().contains(&"172.25.47.1"));
+        assert!(fallback_device_addrs().contains(&USB_FALLBACK_ADDR));
     }
 }

@@ -1,6 +1,9 @@
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+pub const DEFAULT_DEVICE_HOST: &str = "digitalpaper.local";
+pub const USB_FALLBACK_ADDR: &str = "172.25.47.1";
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum TransportKind {
@@ -79,6 +82,49 @@ pub struct WifiNetwork {
     pub ssid: String,
     pub security: String,
     pub connected: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct WifiConfigInput {
+    pub ssid: String,
+    pub security: String,
+    pub passwd: String,
+    pub dhcp: String,
+    pub static_address: String,
+    pub gateway: String,
+    pub network_mask: String,
+    pub dns1: String,
+    pub dns2: String,
+    pub proxy: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum UsbSwitchMode {
+    Auto,
+    Ecm,
+    Rndis,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum UsbStatusKind {
+    NoUsbHardware,
+    UsbSerialOnly,
+    UsbNetworkVisible,
+    DptEndpointReachable,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct UsbStatus {
+    pub kind: UsbStatusKind,
+    pub tty_paths: Vec<String>,
+    pub iface_names: Vec<String>,
+    pub candidate_addrs: Vec<String>,
+    pub endpoint_addr: Option<String>,
+    pub message: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

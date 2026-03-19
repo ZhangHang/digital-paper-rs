@@ -7,9 +7,10 @@ use crossterm::{
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, size, EnterAlternateScreen, LeaveAlternateScreen},
 };
-use digital_paper_domain::{DeviceStatus, DeviceSummary, RemoteEntry, RemoteEntryType};
+use digital_paper_domain::{
+    DeviceStatus, DeviceSummary, RemoteEntry, RemoteEntryType, UsbStatusKind, DEFAULT_DEVICE_HOST,
+};
 use digital_paper_provider::{rust_native_provider, ProviderRef};
-use if_addrs::IfAddr;
 use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     prelude::{Color, CrosstermBackend, Line, Modifier, Span, Style},
@@ -18,12 +19,10 @@ use ratatui::{
     },
     Frame, Terminal,
 };
-use reqwest::blocking::Client;
 use std::{
     collections::{HashMap, HashSet},
     fs,
     io::{self},
-    net::Ipv4Addr,
     path::{Path, PathBuf},
     process::Command,
     sync::mpsc::{self, Receiver, Sender},
@@ -216,7 +215,7 @@ impl TuiApp {
             usb_hint: None,
             usb_candidate: None,
             usb_attached: false,
-            add_ip: "192.168.1.92".into(),
+            add_ip: default_device_addr(),
             add_pin: String::new(),
             add_field: AddField::Ip,
             add_message: None,
@@ -398,11 +397,7 @@ impl TuiApp {
                 self.add_message = None;
             }
             KeyCode::Char('u') => {
-                if let Some(addr) = self.usb_candidate.clone() {
-                    self.add_ip = addr;
-                    self.screen = Screen::AddDevice;
-                    self.begin_pair_for_current_ip();
-                }
+                self.recover_usb_network();
             }
             _ => {}
         }
@@ -1058,33 +1053,44 @@ impl TuiApp {
             }
             Ok(_) | Err(_) => {
                 self.devices.clear();
-                match discover_usb_pair_target() {
-                    UsbPairDiscovery::Found(addr) => {
-                        self.usb_candidate = Some(addr.clone());
-                        self.usb_hint = Some(format!(
-                            "A Digital Paper device was found over USB at {addr}. Press 'u' to start pairing."
-                        ));
-                        self.usb_attached = true;
-                    }
-                    UsbPairDiscovery::NoUsbInterface => {
-                        self.usb_candidate = None;
-                        self.usb_attached = detect_attached_usb_dpt();
-                        self.usb_hint = if self.usb_attached {
-                            Some("USB hardware is attached, but the USB network endpoint is not visible.".into())
-                        } else {
-                            None
-                        };
-                    }
-                    UsbPairDiscovery::NoDptEndpoint => {
-                        self.usb_candidate = None;
-                        self.usb_attached = detect_attached_usb_dpt();
-                        self.usb_hint = if self.usb_attached {
-                            Some("USB hardware is attached, but the DPT pairing endpoint did not respond.".into())
-                        } else {
-                            None
-                        };
-                    }
+                if let Ok(status) = self.provider.usb_status() {
+                    self.usb_attached = !matches!(status.kind, UsbStatusKind::NoUsbHardware);
+                    self.usb_candidate = status.endpoint_addr.clone();
+                    self.usb_hint = Some(match status.kind {
+                        UsbStatusKind::DptEndpointReachable => format!(
+                            "{} Press 'u' to recover/recheck and start pairing.",
+                            status.message
+                        ),
+                        UsbStatusKind::UsbSerialOnly => format!(
+                            "{} Press 'u' to switch USB mode to network and retry.",
+                            status.message
+                        ),
+                        UsbStatusKind::UsbNetworkVisible => format!(
+                            "{} Press 'u' to retry endpoint recovery.",
+                            status.message
+                        ),
+                        UsbStatusKind::NoUsbHardware => status.message,
+                    });
                 }
+            }
+        }
+    }
+
+    fn recover_usb_network(&mut self) {
+        match self.provider.usb_recover() {
+            Ok(status) => {
+                self.usb_candidate = status.endpoint_addr.clone();
+                self.launcher_message = Some(status.message.clone());
+                if let Some(addr) = status.endpoint_addr {
+                    self.add_ip = addr;
+                    self.screen = Screen::AddDevice;
+                    self.begin_pair_for_current_ip();
+                } else {
+                    self.scan_devices();
+                }
+            }
+            Err(err) => {
+                self.launcher_error = Some(format!("USB recover failed: {err}"));
             }
         }
     }
@@ -1374,7 +1380,7 @@ impl TuiApp {
 
         if self.devices.is_empty() {
             let text = if let Some(addr) = &self.usb_candidate {
-                format!("USB pairing candidate found at {addr}. Press 'u' to begin pairing.")
+                format!("USB endpoint detected at {addr}. Press 'u' to recover/recheck before pairing.")
             } else if let Some(hint) = &self.usb_hint {
                 hint.clone()
             } else {
@@ -1427,7 +1433,7 @@ impl TuiApp {
                 self.launcher_message
                     .clone()
                     .or_else(|| self.launcher_error.clone())
-                    .unwrap_or_else(|| "Keys: ↑↓ select  Enter open  a add device  u usb pair  r refresh  q quit".into()),
+                    .unwrap_or_else(|| "Keys: ↑↓ select  Enter open  a add device  u usb recover  r refresh  q quit".into()),
             )
             .block(Block::default().borders(Borders::ALL).title("Status"))
             .wrap(Wrap { trim: true }),
@@ -1688,6 +1694,14 @@ impl TuiApp {
     }
 }
 
+fn default_device_addr() -> String {
+    std::env::var("DPT_DEFAULT_ADDR")
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| DEFAULT_DEVICE_HOST.to_string())
+}
+
 fn draw_prompt(frame: &mut Frame, prompt: &PromptState) {
     let area = centered_rect(70, 30, frame.area());
     frame.render_widget(Clear, area);
@@ -1913,142 +1927,6 @@ fn search_walk(
 
 fn parent_path(path: &str) -> &str {
     path.rsplit_once('/').map(|(parent, _)| parent).unwrap_or("")
-}
-
-fn looks_like_usb_interface(name: &str) -> bool {
-    let lower = name.to_ascii_lowercase();
-    if lower == "en0"
-        || lower.starts_with("awdl")
-        || lower.starts_with("llw")
-        || lower.starts_with("utun")
-        || lower.starts_with("lo")
-        || lower.starts_with("bridge")
-        || lower.starts_with("ap")
-        || lower.starts_with("anpi")
-    {
-        return false;
-    }
-    lower.starts_with("en")
-        || lower.starts_with("eth")
-        || lower.starts_with("usb")
-        || lower.starts_with("rndis")
-        || lower.starts_with("ecm")
-        || lower.starts_with("wlanusb")
-}
-
-fn usb_hint_addrs() -> (bool, Vec<String>) {
-    let ifaces = match if_addrs::get_if_addrs() {
-        Ok(ifaces) => ifaces,
-        Err(_) => return (false, Vec::new()),
-    };
-    let mut saw_usb_interface = false;
-    let mut candidates = Vec::new();
-    for iface in ifaces {
-        if !looks_like_usb_interface(&iface.name) {
-            continue;
-        }
-        let (ip, netmask) = match iface.addr {
-            IfAddr::V4(v4) => (v4.ip, v4.netmask),
-            IfAddr::V6(_) => continue,
-        };
-        let Some(iface_candidates) = usb_probe_candidates(ip, netmask) else {
-            continue;
-        };
-        saw_usb_interface = true;
-        candidates.extend(iface_candidates);
-    }
-    (saw_usb_interface, candidates)
-}
-
-fn usb_probe_candidates(ip: Ipv4Addr, netmask: Ipv4Addr) -> Option<Vec<String>> {
-    if ip.is_loopback() {
-        return None;
-    }
-    let oct = ip.octets();
-    let is_private = oct[0] == 10
-        || (oct[0] == 172 && (16..=31).contains(&oct[1]))
-        || (oct[0] == 192 && oct[1] == 168);
-    let is_link_local = oct[0] == 169 && oct[1] == 254;
-    if !is_private && !is_link_local {
-        return None;
-    }
-
-    let ip_u32 = u32::from(ip);
-    let mask_u32 = u32::from(netmask);
-    let network = ip_u32 & mask_u32;
-    let broadcast = network | !mask_u32;
-    let host_count = broadcast.saturating_sub(network).saturating_sub(1);
-    let mut candidates = Vec::new();
-
-    if host_count <= 64 {
-        for host in (network.saturating_add(1))..broadcast {
-            if host == ip_u32 {
-                continue;
-            }
-            candidates.push(Ipv4Addr::from(host).to_string());
-        }
-    } else {
-        for host in [1_u8, 2, 10, 20, 30, 50, 80, 92, 100, 110, 150, 200, 254] {
-            if host == oct[3] {
-                continue;
-            }
-            let candidate = Ipv4Addr::new(oct[0], oct[1], oct[2], host);
-            let candidate_u32 = u32::from(candidate);
-            if candidate_u32 <= network || candidate_u32 >= broadcast {
-                continue;
-            }
-            candidates.push(candidate.to_string());
-        }
-    }
-
-    Some(candidates)
-}
-
-fn probe_usb_pair_candidate(addr: &str) -> bool {
-    let client = match Client::builder().timeout(Duration::from_millis(900)).build() {
-        Ok(client) => client,
-        Err(_) => return false,
-    };
-    client
-        .get(format!("http://{addr}:8080/register/information"))
-        .send()
-        .map(|resp| resp.status().is_success())
-        .unwrap_or(false)
-}
-
-enum UsbPairDiscovery {
-    Found(String),
-    NoUsbInterface,
-    NoDptEndpoint,
-}
-
-fn discover_usb_pair_target() -> UsbPairDiscovery {
-    let (saw_usb_interface, candidates) = usb_hint_addrs();
-    if !saw_usb_interface {
-        return UsbPairDiscovery::NoUsbInterface;
-    }
-    for addr in candidates {
-        if probe_usb_pair_candidate(&addr) {
-            return UsbPairDiscovery::Found(addr);
-        }
-    }
-    UsbPairDiscovery::NoDptEndpoint
-}
-
-fn detect_attached_usb_dpt() -> bool {
-    let Ok(output) = Command::new("ioreg")
-        .args(["-p", "IOUSB", "-w", "0", "-l"])
-        .output()
-    else {
-        return false;
-    };
-    if !output.status.success() {
-        return false;
-    }
-    let stdout = String::from_utf8_lossy(&output.stdout).to_ascii_lowercase();
-    stdout.contains("dpt-rp1")
-        || stdout.contains("dpt_rp1")
-        || (stdout.contains("sony") && stdout.contains("324650005030476"))
 }
 
 fn launcher_hit_index(row: u16, item_count: usize) -> Option<usize> {

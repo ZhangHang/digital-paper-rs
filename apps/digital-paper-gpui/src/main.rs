@@ -1,7 +1,8 @@
 use anyhow::Result;
-use digital_paper_domain::{DeviceStatus, DeviceSummary, RemoteEntry, RemoteEntryType};
+use digital_paper_domain::{
+    DeviceStatus, DeviceSummary, RemoteEntry, RemoteEntryType, DEFAULT_DEVICE_HOST,
+};
 use digital_paper_provider::{rust_native_provider, ProviderRef};
-use if_addrs::IfAddr;
 use gpui::{
     actions, div, prelude::FluentBuilder, px, size, App, AppContext, Application, Bounds,
     ClickEvent, Context, ExternalPaths, InteractiveElement, IntoElement, KeyBinding, Menu,
@@ -13,13 +14,10 @@ use gpui_component::{
     scroll::ScrollableElement, ActiveTheme, Root,
 };
 use parking_lot::Mutex;
-use reqwest::blocking::Client;
 use std::{
     cell::RefCell,
     collections::{HashMap, HashSet},
     fs,
-    io::Write,
-    net::Ipv4Addr,
     path::PathBuf,
     process::Command,
     rc::Rc,
@@ -132,33 +130,27 @@ fn main() {
 
 struct LauncherView {
     shared: Shared,
-    devices: Vec<DeviceSummary>,
     error: Option<String>,
-    usb_hint: Option<String>,
-    usb_candidate: Option<String>,
-    usb_attached: bool,
     busy_modal: Option<TransferModalState>,
     seen_refresh_nonce: u64,
     pending_auto_open: Option<DeviceSummary>,
+    pending_auto_pair_addr: Option<String>,
     scanning: bool,
-    anim_tick: u64,
     last_scan_at: Instant,
 }
 
 impl LauncherView {
+    const DEFAULT_ADDR: &'static str = DEFAULT_DEVICE_HOST;
+
     fn new(shared: Shared, _window: &mut Window, _cx: &mut Context<Self>) -> Self {
         let mut this = Self {
             shared,
-            devices: Vec::new(),
             error: None,
-            usb_hint: None,
-            usb_candidate: None,
-            usb_attached: false,
             busy_modal: None,
             seen_refresh_nonce: 0,
             pending_auto_open: None,
+            pending_auto_pair_addr: None,
             scanning: false,
-            anim_tick: 0,
             last_scan_at: Instant::now() - Duration::from_secs(10),
         };
         this.request_scan(_cx);
@@ -172,98 +164,42 @@ impl LauncherView {
         self.scanning = true;
         self.last_scan_at = Instant::now();
         self.error = None;
-        self.usb_hint = None;
-        self.usb_candidate = None;
-        self.usb_attached = false;
+        self.pending_auto_pair_addr = None;
         let provider = self.shared.lock().provider.clone();
         cx.notify();
         cx.spawn(async move |this, cx| {
-            let discovered = provider.discover_devices();
-            let usb = match &discovered {
-                Ok(devices) if !devices.is_empty() => None,
-                Ok(_) => Some(discover_usb_pair_target()),
-                Err(err) if err.to_string() == "device not found" => Some(discover_usb_pair_target()),
-                Err(_) => None,
-            };
-            let attached_usb = detect_attached_usb_dpt();
+            let addr = Self::DEFAULT_ADDR.to_string();
+            let discovered = provider.connect(Some(addr.clone()), None, None);
             this.update(cx, |this, cx| {
                 this.scanning = false;
                 match discovered {
-                    Ok(devices) if !devices.is_empty() => {
-                        let selected = devices
-                            .iter()
-                            .find(|device| device.paired)
-                            .cloned()
-                            .or_else(|| devices.first().cloned());
+                    Ok(device) if device.paired => {
                         this.error = None;
-                        this.usb_hint = None;
-                        this.usb_candidate = None;
-                        this.usb_attached = false;
-                        this.devices = selected.into_iter().collect();
-                        this.pending_auto_open =
-                            this.devices.first().filter(|d| d.paired).cloned();
+                        this.pending_auto_open = Some(device);
+                        this.pending_auto_pair_addr = None;
                     }
                     Ok(_) => {
-                        match usb.unwrap_or(UsbPairDiscovery::NoDptEndpoint) {
-                            UsbPairDiscovery::Found(addr) => {
-                                this.error = None;
-                                this.usb_hint = Some(
-                                    "A Digital Paper device was found over USB. Start pairing to continue."
-                                        .into(),
-                                );
-                                this.usb_candidate = Some(addr);
-                                this.usb_attached = true;
-                                this.devices.clear();
-                                this.pending_auto_open = None;
-                            }
-                            UsbPairDiscovery::NoUsbInterface | UsbPairDiscovery::NoDptEndpoint => {
-                                this.error = None;
-                                this.usb_attached = attached_usb;
-                                this.usb_hint = attached_usb.then_some(
-                                    "Sony DPT-RP1 is attached over USB, but the USB network link is not active on this Mac."
-                                        .into(),
-                                );
-                                this.usb_candidate = None;
-                                this.devices.clear();
-                                this.pending_auto_open = None;
-                            }
-                        }
+                        this.error = None;
+                        this.pending_auto_open = None;
+                        this.pending_auto_pair_addr = Some(addr);
                     }
                     Err(err) => {
                         let message = err.to_string();
-                        if message == "device not found" {
-                            match usb.unwrap_or(UsbPairDiscovery::NoDptEndpoint) {
-                                UsbPairDiscovery::Found(addr) => {
-                                    this.error = None;
-                                    this.usb_hint = Some(
-                                        "A Digital Paper device was found over USB. Start pairing to continue."
-                                            .into(),
-                                    );
-                                    this.usb_candidate = Some(addr);
-                                    this.usb_attached = true;
-                                    this.devices.clear();
-                                    this.pending_auto_open = None;
-                                }
-                                UsbPairDiscovery::NoUsbInterface
-                                | UsbPairDiscovery::NoDptEndpoint => {
-                                    this.error = None;
-                                    this.usb_attached = attached_usb;
-                                    this.usb_hint = attached_usb.then_some(
-                                        "Sony DPT-RP1 is attached over USB, but the USB network link is not active on this Mac."
-                                            .into(),
-                                    );
-                                    this.usb_candidate = None;
-                                    this.devices.clear();
-                                    this.pending_auto_open = None;
-                                }
-                            }
-                        } else {
-                            this.error = Some(message);
-                            this.usb_hint = None;
-                            this.usb_candidate = None;
-                            this.usb_attached = false;
-                            this.devices.clear();
+                        if message == "pairing required"
+                            || message == "authentication failed"
+                            || message == "device not found"
+                        {
+                            this.error = None;
                             this.pending_auto_open = None;
+                            this.pending_auto_pair_addr = Some(addr);
+                        } else {
+                            this.error = Some(format!(
+                                "Could not reach {}: {}",
+                                Self::DEFAULT_ADDR,
+                                message
+                            ));
+                            this.pending_auto_open = None;
+                            this.pending_auto_pair_addr = None;
                         }
                     }
                 }
@@ -281,16 +217,6 @@ impl LauncherView {
         }
         self.seen_refresh_nonce = nonce;
         self.request_scan(cx);
-    }
-
-    fn on_open_device(
-        &mut self,
-        device: DeviceSummary,
-        _: &ClickEvent,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.begin_open_device(device, window, cx);
     }
 
     fn begin_open_device(
@@ -381,45 +307,15 @@ impl LauncherView {
         });
     }
 
-    fn on_start_usb_pair(&mut self, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
-        let Some(addr) = self.usb_candidate.clone() else {
-            self.usb_hint = Some("No USB device is ready to pair.".into());
-            cx.notify();
-            return;
-        };
-        self.error = None;
-        self.usb_hint = None;
-        if let Err(err) = open_add_device_window(self.shared.clone(), Some(addr), true, cx) {
-            self.error = Some(err.to_string());
-            cx.notify();
-        }
-    }
-
-    fn on_open_add_device(&mut self, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
-        self.error = None;
-        if let Err(err) = open_add_device_window(self.shared.clone(), None, false, cx) {
-            self.error = Some(err.to_string());
-            cx.notify();
-        }
-    }
-
-    fn scanning_label(&self) -> &'static str {
-        match self.anim_tick % 4 {
-            0 => "Looking for your Digital Paper device",
-            1 => "Looking for your Digital Paper device.",
-            2 => "Looking for your Digital Paper device..",
-            _ => "Looking for your Digital Paper device...",
-        }
-    }
 }
 
 impl Render for LauncherView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.sync_external_refresh(cx);
         cx.on_next_frame(window, |this, _window, cx| {
-            this.anim_tick = this.anim_tick.wrapping_add(1);
             if !this.scanning
                 && this.pending_auto_open.is_none()
+                && this.pending_auto_pair_addr.is_none()
                 && this.last_scan_at.elapsed() >= Duration::from_secs(3)
             {
                 this.request_scan(cx);
@@ -432,35 +328,49 @@ impl Render for LauncherView {
                 this.begin_open_device(device.clone(), window, cx);
             });
         }
+        if let Some(addr) = self.pending_auto_pair_addr.take() {
+            let shared = self.shared.clone();
+            cx.on_next_frame(window, move |this, window, cx| {
+                match open_add_device_window(shared.clone(), Some(addr.clone()), true, cx) {
+                    Ok(_) => window.remove_window(),
+                    Err(err) => {
+                        this.error = Some(format!("Could not start pairing for {}: {}", addr, err));
+                        cx.notify();
+                    }
+                }
+            });
+        }
         div()
             .flex()
             .flex_col()
             .size_full()
             .on_action(|_: &CloseWindowMenu, window, _| window.remove_window())
-            .p_5()
-            .gap_4()
+            .p_6()
+            .gap_5()
             .bg(cx.theme().background)
+            .text_color(cx.theme().foreground)
             .child(
                 div()
                     .flex()
                     .flex_col()
-                    .gap_1()
+                    .gap_1p5()
                     .child(
                         div()
-                            .text_xl()
-                            .font_weight(gpui::FontWeight::BOLD)
+                            .text_2xl()
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
                             .child("Digital Paper"),
                     )
                     .child(
                         div()
                             .text_sm()
                             .text_color(cx.theme().muted_foreground)
-                            .child(
-                                "Connect once, then drop straight into your document library.",
-                            ),
+                            .child(format!(
+                                "Only {} is supported in launcher mode.",
+                                Self::DEFAULT_ADDR
+                            )),
                     ),
             )
-            .child(if self.devices.is_empty() {
+            .child(
                 div()
                     .flex_1()
                     .border_1()
@@ -470,178 +380,61 @@ impl Render for LauncherView {
                     .flex()
                     .flex_col()
                     .justify_center()
-                    .gap_2()
-                    .bg(gpui::hsla(0.58, 0.18, 0.16, 0.42))
+                    .gap_3()
+                    .bg(cx.theme().secondary)
+                    .child(
+                        div()
+                            .px_2()
+                            .py_1()
+                            .rounded_md()
+                            .text_xs()
+                            .font_weight(gpui::FontWeight::MEDIUM)
+                            .bg(cx.theme().accent)
+                            .text_color(cx.theme().accent_foreground)
+                            .child(if self.scanning { "Connecting" } else { "Ready" }),
+                    )
                     .child(
                         div()
                             .text_lg()
                             .font_weight(gpui::FontWeight::SEMIBOLD)
-                            .child(if self.usb_candidate.is_some() {
-                                "Digital Paper device found over USB."
-                            } else if self.usb_attached {
-                                "Digital Paper is attached over USB."
+                            .child(if self.scanning {
+                                "Connecting to device..."
                             } else {
-                                self.scanning_label()
+                                "Open or pair your Digital Paper device."
                             }),
                     )
                     .child(
                         div()
                             .text_sm()
                             .text_color(cx.theme().muted_foreground)
-                            .child(if self.usb_candidate.is_some() {
-                                "Start pairing to use this device."
-                            } else if self.usb_attached {
-                                "The device is visible over USB hardware, but macOS has not exposed the USB network endpoint."
-                            } else {
-                                "Connect over Wi-Fi or USB. The scanner keeps looking automatically."
-                            }),
+                            .child(format!(
+                                "Launcher uses only {}. If credentials are missing, pairing starts automatically.",
+                                Self::DEFAULT_ADDR
+                            )),
                     )
-                    .child(
-                        div()
-                            .flex()
-                            .flex_row()
-                            .gap_2()
-                            .child(
-                                Button::new("open-add-device-empty")
-                                    .primary()
-                                    .label("Add Device Manually")
-                                    .on_click(cx.listener(Self::on_open_add_device)),
-                            )
-                            .when(self.usb_candidate.is_some(), |view| {
-                                view.child(
-                                    Button::new("start-usb-pair")
-                                        .outline()
-                                        .label("Start Pairing")
-                                        .on_click(cx.listener(Self::on_start_usb_pair)),
-                                )
-                            }),
-                    )
-            } else {
-                div()
-                    .flex_1()
-                    .border_1()
-                    .border_color(cx.theme().border)
-                    .rounded_lg()
-                    .p_2()
-                    .flex()
-                    .flex_col()
-                    .gap_2()
-                    .bg(gpui::hsla(0.58, 0.18, 0.16, 0.26))
-                    .child(
-                        div()
-                            .px_2()
-                            .pt_1()
-                            .flex()
-                            .flex_col()
-                            .gap_0p5()
-                            .child(
-                                div()
-                                    .font_weight(gpui::FontWeight::SEMIBOLD)
-                                    .child("Available Device"),
-                            )
-                            .child(
-                                div()
-                                    .text_sm()
-                                    .text_color(cx.theme().muted_foreground)
-                                    .child("Open the paired device below or add another one manually."),
-                            ),
-                    )
-                    .children(self.devices.iter().enumerate().map(|(index, device)| {
-                        let device_clone = device.clone();
-                        ListItem::new(("open-device-row", index))
-                            .selected(false)
-                            .on_click(cx.listener(move |this, e, window, cx| {
-                                this.on_open_device(device_clone.clone(), e, window, cx);
-                            }))
-                            .flex()
-                            .flex_row()
-                            .justify_between()
-                            .child(
-                                div()
-                                    .flex()
-                                    .flex_col()
-                                    .gap_1()
-                                    .child(
-                                        div()
-                                            .font_weight(gpui::FontWeight::SEMIBOLD)
-                                            .truncate()
-                                            .child(device.name.clone()),
-                                    )
-                                    .child(
-                                        div()
-                                            .text_sm()
-                                            .text_color(cx.theme().muted_foreground)
-                                            .child(
-                                                device
-                                                    .reachable_addrs
-                                                    .first()
-                                                    .cloned()
-                                                    .unwrap_or_else(|| "unknown".into()),
-                                            ),
-                                    ),
-                            )
-                            .child(
-                                div()
-                                    .px_2()
-                                    .py_1()
-                                    .rounded_md()
-                                    .bg(gpui::hsla(
-                                        0.4,
-                                        0.24,
-                                        if device.paired { 0.34 } else { 0.24 },
-                                        0.55,
-                                    ))
-                                    .text_sm()
-                                    .font_weight(gpui::FontWeight::MEDIUM)
-                                    .child(if device.paired { "Paired" } else { "Detected" }),
-                            )
-                    }))
-            })
+            )
             .child(
                 div()
                     .flex()
-                    .flex_row()
-                    .justify_between()
-                    .items_center()
+                    .items_start()
                     .child(
                         div()
                             .text_sm()
                             .text_color(cx.theme().muted_foreground)
-                            .child("Shortcuts: Cmd-N launcher, Cmd-Shift-N manual setup"),
-                    )
-                    .child(
-                        Button::new("open-add-device-footer")
-                            .outline()
-                            .compact()
-                            .label("Add Device")
-                            .on_click(cx.listener(Self::on_open_add_device)),
+                            .child(format!("Target: {}", Self::DEFAULT_ADDR)),
                     ),
             )
-            .when_some(self.usb_hint.clone(), |view, msg| {
-                view.child(
-                    div()
-                        .rounded_md()
-                        .border_1()
-                        .border_color(cx.theme().border)
-                        .bg(gpui::hsla(0.4, 0.24, 0.24, 0.2))
-                        .px_3()
-                        .py_2()
-                        .text_sm()
-                        .text_color(cx.theme().muted_foreground)
-                        .child(msg),
-                )
-            })
             .when_some(self.error.clone(), |view, err| {
                 view.child(
                     div()
                         .rounded_md()
                         .border_1()
-                        .border_color(cx.theme().border)
-                        .bg(gpui::hsla(0.0, 0.28, 0.22, 0.2))
+                        .border_color(cx.theme().danger)
+                        .bg(cx.theme().danger)
                         .px_3()
                         .py_2()
                         .text_sm()
-                        .text_color(cx.theme().foreground)
+                        .text_color(cx.theme().danger_foreground)
                         .child(err),
                 )
             })
@@ -1157,11 +950,12 @@ impl Render for BrowserView {
             .on_action(|_: &CloseWindowMenu, window, _| window.remove_window())
             .on_drop(cx.listener(Self::on_external_drop_root))
             .bg(cx.theme().background)
+            .text_color(cx.theme().foreground)
             .child(
                 div()
                     .flex_shrink_0()
-                    .px_3()
-                    .pt_3()
+                    .px_4()
+                    .pt_4()
                     .pb_2()
                     .flex()
                     .flex_col()
@@ -1194,7 +988,8 @@ impl Render for BrowserView {
                                     .px_2()
                                     .py_1()
                                     .rounded_md()
-                                    .bg(gpui::hsla(0.58, 0.18, 0.16, 0.36))
+                                    .bg(cx.theme().accent)
+                                    .text_color(cx.theme().accent_foreground)
                                     .text_sm()
                                     .child(format!("{row_count} items")),
                             ),
@@ -1204,12 +999,12 @@ impl Render for BrowserView {
                 div()
                     .flex_1()
                     .min_h_0()
-                    .mx_3()
-                    .mb_2()
+                    .mx_4()
+                    .mb_3()
                     .rounded_lg()
                     .border_1()
                     .border_color(cx.theme().border)
-                    .bg(gpui::hsla(0.58, 0.18, 0.16, 0.2))
+                    .bg(cx.theme().list)
                     .overflow_y_scrollbar()
                     .flex()
                     .child(
@@ -1346,6 +1141,8 @@ impl Render for BrowserView {
                                                     .flex_row()
                                                     .gap_1()
                                                     .items_center()
+                                                    .flex_1()
+                                                    .min_w_0()
                                                     .child(div().w(px((depth as f32) * 12.0)))
                                                     .child(
                                                         div()
@@ -1353,7 +1150,14 @@ impl Render for BrowserView {
                                                             .text_sm()
                                                             .child(icon_text),
                                                     )
-                                                    .child(entry.name.clone()),
+                                                    .child(
+                                                        div()
+                                                            .flex_1()
+                                                            .min_w_0()
+                                                            .child(
+                                                                wrap_name_for_ui(&entry.name),
+                                                            ),
+                                                    ),
                                             )
                                             .child(
                                                 div()
@@ -1412,14 +1216,14 @@ impl Render for BrowserView {
             .child(
                 div()
                     .flex_shrink_0()
-                    .mx_3()
+                    .mx_4()
                     .mb_3()
                     .px_3()
                     .py_2()
                     .rounded_lg()
                     .border_1()
                     .border_color(cx.theme().border)
-                    .bg(gpui::hsla(0.58, 0.18, 0.16, 0.22))
+                    .bg(cx.theme().secondary)
                     .text_sm()
                     .text_color(cx.theme().muted_foreground)
                     .child(
@@ -1432,6 +1236,25 @@ impl Render for BrowserView {
                 view.child(render_busy_overlay(cx, modal))
             })
     }
+}
+
+fn wrap_name_for_ui(name: &str) -> String {
+    let mut out = String::with_capacity(name.len() + 16);
+    for ch in name.chars() {
+        out.push(ch);
+        if matches!(ch, '_' | '-' | '.' | '/' | '，' | '。' | '：' | '；') {
+            out.push('\u{200B}');
+        }
+    }
+    out
+}
+
+fn default_device_addr() -> String {
+    std::env::var("DPT_DEFAULT_ADDR")
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| DEFAULT_DEVICE_HOST.to_string())
 }
 
 struct AddDeviceView {
@@ -1451,7 +1274,7 @@ impl AddDeviceView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let default_ip = initial_ip.unwrap_or_else(|| "192.168.1.92".to_string());
+        let default_ip = initial_ip.unwrap_or_else(default_device_addr);
         let ip_input = cx.new(|cx| InputState::new(window, cx).default_value(default_ip));
         let pin_input = cx.new(|cx| InputState::new(window, cx).placeholder("PIN from device"));
         let mut this = Self {
@@ -1612,18 +1435,19 @@ impl Render for AddDeviceView {
             .flex_col()
             .size_full()
             .on_action(|_: &CloseWindowMenu, window, _| window.remove_window())
-            .p_5()
-            .gap_4()
+            .p_6()
+            .gap_5()
             .bg(cx.theme().background)
+            .text_color(cx.theme().foreground)
             .child(
                 div()
                     .flex()
                     .flex_col()
-                    .gap_1()
+                    .gap_1p5()
                     .child(
                         div()
-                            .text_xl()
-                            .font_weight(gpui::FontWeight::BOLD)
+                            .text_2xl()
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
                             .child("Add Device"),
                     )
                     .child(
@@ -1640,11 +1464,11 @@ impl Render for AddDeviceView {
                     .border_1()
                     .border_color(cx.theme().border)
                     .rounded_lg()
-                    .p_4()
+                    .p_5()
                     .flex()
                     .flex_col()
-                    .gap_2()
-                    .bg(gpui::hsla(0.58, 0.18, 0.16, 0.26))
+                    .gap_3()
+                    .bg(cx.theme().secondary)
                     .child(
                         div()
                             .text_sm()
@@ -1690,7 +1514,7 @@ impl Render for AddDeviceView {
                         .rounded_lg()
                         .border_1()
                         .border_color(cx.theme().border)
-                        .bg(gpui::hsla(0.4, 0.24, 0.24, 0.2))
+                        .bg(cx.theme().accent)
                         .p_3()
                         .flex()
                         .flex_col()
@@ -1718,6 +1542,7 @@ impl Render for AddDeviceView {
                         .rounded_md()
                         .border_1()
                         .border_color(cx.theme().border)
+                        .bg(cx.theme().secondary)
                         .px_3()
                         .py_2()
                         .text_sm()
@@ -1730,13 +1555,13 @@ impl Render for AddDeviceView {
     }
 }
 
-fn render_busy_overlay(cx: &mut App, modal: TransferModalState) -> impl IntoElement {
+fn render_busy_overlay(_cx: &mut App, modal: TransferModalState) -> impl IntoElement {
     div()
         .absolute()
         .top_0()
         .left_0()
         .size_full()
-        .bg(gpui::hsla(0.58, 0.18, 0.05, 0.52))
+        .bg(gpui::transparent_black())
         .flex()
         .items_center()
         .justify_center()
@@ -1746,8 +1571,9 @@ fn render_busy_overlay(cx: &mut App, modal: TransferModalState) -> impl IntoElem
                 .p_5()
                 .rounded_lg()
                 .border_1()
-                .border_color(cx.theme().border)
-                .bg(gpui::hsla(0.58, 0.1, 0.1, 0.98))
+                .border_color(_cx.theme().border)
+                .bg(_cx.theme().popover)
+                .text_color(_cx.theme().popover_foreground)
                 .flex()
                 .flex_col()
                 .gap_3()
@@ -1760,13 +1586,13 @@ fn render_busy_overlay(cx: &mut App, modal: TransferModalState) -> impl IntoElem
                 .child(
                     div()
                         .text_sm()
-                        .text_color(cx.theme().muted_foreground)
+                        .text_color(_cx.theme().muted_foreground)
                         .child(modal.detail),
                 )
                 .child(
                     div()
                         .text_xs()
-                        .text_color(cx.theme().muted_foreground)
+                        .text_color(_cx.theme().muted_foreground)
                         .child("Please wait while Digital Paper completes this step."),
                 ),
         )
@@ -1834,259 +1660,4 @@ fn open_add_device_window(
         },
     )?;
     Ok(())
-}
-
-fn looks_like_usb_interface(name: &str) -> bool {
-    let lower = name.to_ascii_lowercase();
-    if lower == "en0"
-        || lower.starts_with("awdl")
-        || lower.starts_with("llw")
-        || lower.starts_with("utun")
-        || lower.starts_with("lo")
-        || lower.starts_with("bridge")
-        || lower.starts_with("ap")
-        || lower.starts_with("anpi")
-    {
-        return false;
-    }
-    lower.starts_with("en")
-        || lower.starts_with("eth")
-        || lower.starts_with("usb")
-        || lower.starts_with("rndis")
-        || lower.starts_with("ecm")
-        || lower.starts_with("wlanusb")
-}
-
-fn usb_hint_addrs() -> (bool, Vec<String>) {
-    let ifaces = match if_addrs::get_if_addrs() {
-        Ok(ifaces) => ifaces,
-        Err(err) => {
-            append_debug_log("gpui", &format!("Failed to enumerate interfaces: {err}"));
-            return (false, Vec::new());
-        }
-    };
-    let mut saw_usb_interface = false;
-    let mut candidates = Vec::new();
-    for iface in ifaces {
-        if !looks_like_usb_interface(&iface.name) {
-            continue;
-        }
-        let (ip, netmask) = match iface.addr {
-            IfAddr::V4(v4) => (v4.ip, v4.netmask),
-            IfAddr::V6(_) => continue,
-        };
-        append_debug_log(
-            "gpui",
-            &format!("USB-like interface {} ip={} mask={}", iface.name, ip, netmask),
-        );
-        let Some(iface_candidates) = usb_probe_candidates(ip, netmask) else {
-            append_debug_log(
-                "gpui",
-                &format!("Skipping interface {} because subnet is not probeable", iface.name),
-            );
-            continue;
-        };
-        saw_usb_interface = true;
-        append_debug_log(
-            "gpui",
-            &format!(
-                "Interface {} produced {} candidate addresses",
-                iface.name,
-                iface_candidates.len()
-            ),
-        );
-        candidates.extend(iface_candidates);
-    }
-    (saw_usb_interface, candidates)
-}
-
-fn usb_probe_candidates(ip: Ipv4Addr, netmask: Ipv4Addr) -> Option<Vec<String>> {
-    if ip.is_loopback() {
-        return None;
-    }
-
-    let oct = ip.octets();
-    let is_private = oct[0] == 10
-        || (oct[0] == 172 && (16..=31).contains(&oct[1]))
-        || (oct[0] == 192 && oct[1] == 168);
-    let is_link_local = oct[0] == 169 && oct[1] == 254;
-    if !is_private && !is_link_local {
-        return None;
-    }
-
-    let ip_u32 = u32::from(ip);
-    let mask_u32 = u32::from(netmask);
-    let network = ip_u32 & mask_u32;
-    let broadcast = network | !mask_u32;
-    let host_count = broadcast.saturating_sub(network).saturating_sub(1);
-
-    let mut candidates = Vec::new();
-    if host_count <= 64 {
-        for host in (network.saturating_add(1))..broadcast {
-            if host == ip_u32 {
-                continue;
-            }
-            candidates.push(Ipv4Addr::from(host).to_string());
-        }
-    } else {
-        for host in [1_u8, 2, 10, 20, 30, 50, 80, 92, 100, 110, 150, 200, 254] {
-            if host == oct[3] {
-                continue;
-            }
-            let candidate = Ipv4Addr::new(oct[0], oct[1], oct[2], host);
-            let candidate_u32 = u32::from(candidate);
-            if candidate_u32 <= network || candidate_u32 >= broadcast {
-                continue;
-            }
-            candidates.push(candidate.to_string());
-        }
-    }
-
-    Some(candidates)
-}
-
-fn probe_usb_pair_candidate(addr: &str) -> bool {
-    let client = match Client::builder()
-        .timeout(Duration::from_millis(900))
-        .build()
-    {
-        Ok(client) => client,
-        Err(_) => return false,
-    };
-
-    let response = client
-        .get(format!("http://{addr}:8080/register/information"))
-        .send();
-
-    match response {
-        Ok(resp) => {
-            let ok = resp.status().is_success();
-            append_debug_log(
-                "gpui",
-                &format!("USB probe {} -> HTTP {} success={ok}", addr, resp.status()),
-            );
-            ok
-        }
-        Err(err) => {
-            append_debug_log("gpui", &format!("USB probe {addr} failed: {err}"));
-            false
-        }
-    }
-}
-
-enum UsbPairDiscovery {
-    Found(String),
-    NoUsbInterface,
-    NoDptEndpoint,
-}
-
-fn discover_usb_pair_target() -> UsbPairDiscovery {
-    let (saw_usb_interface, candidates) = usb_hint_addrs();
-    append_debug_log(
-        "gpui",
-        &format!(
-            "USB discovery saw_usb_interface={} candidate_count={}",
-            saw_usb_interface,
-            candidates.len()
-        ),
-    );
-    if !saw_usb_interface {
-        return UsbPairDiscovery::NoUsbInterface;
-    }
-    for addr in candidates {
-        if probe_usb_pair_candidate(&addr) {
-            return UsbPairDiscovery::Found(addr);
-        }
-    }
-    UsbPairDiscovery::NoDptEndpoint
-}
-
-fn detect_attached_usb_dpt() -> bool {
-    let output = Command::new("ioreg")
-        .args(["-p", "IOUSB", "-w", "0", "-l"])
-        .output();
-    let Ok(output) = output else {
-        append_debug_log("gpui", "Failed to run ioreg for USB hardware detection");
-        return false;
-    };
-    if !output.status.success() {
-        append_debug_log(
-            "gpui",
-            &format!("ioreg exited with status {}", output.status),
-        );
-        return false;
-    }
-    let stdout = String::from_utf8_lossy(&output.stdout).to_ascii_lowercase();
-    let detected = stdout.contains("dpt-rp1")
-        || stdout.contains("dpt_rp1")
-        || (stdout.contains("sony") && stdout.contains("324650005030476"));
-    append_debug_log(
-        "gpui",
-        &format!("USB hardware detection attached={detected}"),
-    );
-    detected
-}
-
-fn append_debug_log(component: &str, message: &str) {
-    let ts = format!(
-        "{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs()
-    );
-    let line = format!("[{ts}] [{component}] {message}\n");
-    let path = debug_log_path();
-    if let Some(parent) = path.parent() {
-        let _ = fs::create_dir_all(parent);
-    }
-    if let Ok(mut file) = fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-    {
-        let _ = file.write_all(line.as_bytes());
-    }
-}
-
-fn debug_log_path() -> PathBuf {
-    std::env::var("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("."))
-        .join(".config/dpt/debug.log")
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{looks_like_usb_interface, usb_probe_candidates};
-    use std::net::Ipv4Addr;
-
-    #[test]
-    fn usb_interface_detection_accepts_common_names() {
-        assert!(looks_like_usb_interface("en7"));
-        assert!(looks_like_usb_interface("usb0"));
-        assert!(looks_like_usb_interface("eth1"));
-        assert!(looks_like_usb_interface("rndis0"));
-    }
-
-    #[test]
-    fn usb_interface_detection_rejects_common_non_usb_names() {
-        assert!(!looks_like_usb_interface("en0"));
-        assert!(!looks_like_usb_interface("lo0"));
-        assert!(!looks_like_usb_interface("bridge100"));
-        assert!(!looks_like_usb_interface("utun4"));
-    }
-
-    #[test]
-    fn usb_probe_candidates_allow_link_local_usb_subnets() {
-        let candidates = usb_probe_candidates(
-            Ipv4Addr::new(169, 254, 42, 23),
-            Ipv4Addr::new(255, 255, 255, 0),
-        )
-        .expect("link-local subnet should be probed");
-
-        assert!(candidates.contains(&"169.254.42.1".to_string()));
-        assert!(candidates.contains(&"169.254.42.254".to_string()));
-        assert!(!candidates.contains(&"169.254.42.23".to_string()));
-    }
 }
