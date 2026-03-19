@@ -5,18 +5,18 @@ use crossterm::{
         MouseButton, MouseEvent, MouseEventKind,
     },
     execute,
-    terminal::{disable_raw_mode, enable_raw_mode, size, EnterAlternateScreen, LeaveAlternateScreen},
+    terminal::{
+        disable_raw_mode, enable_raw_mode, size, EnterAlternateScreen, LeaveAlternateScreen,
+    },
 };
-use digital_paper_domain::{
-    DeviceStatus, DeviceSummary, RemoteEntry, RemoteEntryType, UsbStatusKind, DEFAULT_DEVICE_HOST,
+use digital_paper::{
+    provider, DeviceStatus, DeviceSummary, ProviderRef, RemoteEntry, RemoteEntryType,
+    UsbStatusKind, DEFAULT_DEVICE_HOST,
 };
-use digital_paper_provider::{rust_native_provider, ProviderRef};
 use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     prelude::{Color, CrosstermBackend, Line, Modifier, Span, Style},
-    widgets::{
-        Block, Borders, Clear, List, ListItem, ListState, Paragraph, Row, Table, Wrap,
-    },
+    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Row, Table, Wrap},
     Frame, Terminal,
 };
 use std::{
@@ -46,15 +46,20 @@ fn setup_terminal() -> Result<Terminal<CrosstermBackend<io::Stdout>>> {
 
 fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> {
     disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture)?;
+    execute!(
+        terminal.backend_mut(),
+        LeaveAlternateScreen,
+        DisableMouseCapture
+    )?;
     terminal.show_cursor()?;
     Ok(())
 }
 
 fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> {
-    let provider = rust_native_provider();
+    let provider = provider();
     let mut app = TuiApp::new(provider);
     app.scan_devices();
+    app.bootstrap_default_connect();
 
     while !app.should_quit {
         app.poll_background();
@@ -200,6 +205,7 @@ struct TuiApp {
     search_rx: Option<Receiver<SearchUpdate>>,
     last_browser_click: Option<(String, Instant)>,
     last_launcher_click: Option<(usize, Instant)>,
+    startup_bootstrap_done: bool,
 }
 
 impl TuiApp {
@@ -226,6 +232,7 @@ impl TuiApp {
             search_rx: None,
             last_browser_click: None,
             last_launcher_click: None,
+            startup_bootstrap_done: false,
         }
     }
 
@@ -302,10 +309,8 @@ impl TuiApp {
             SearchUpdate::Failed { query, error } => {
                 if query == browser.search_query {
                     browser.search_results = Some(Vec::new());
-                    browser.search_progress = Some(format!(
-                        "Search failed for '{}': {}",
-                        query, error
-                    ));
+                    browser.search_progress =
+                        Some(format!("Search failed for '{}': {}", query, error));
                 }
                 self.search_rx = None;
             }
@@ -389,6 +394,7 @@ impl TuiApp {
                             .unwrap_or_else(|| self.add_ip.clone());
                         self.screen = Screen::AddDevice;
                         self.add_message = Some("Device detected but not paired yet.".into());
+                        self.begin_pair_for_current_ip();
                     }
                 }
             }
@@ -443,6 +449,7 @@ impl TuiApp {
                                 self.screen = Screen::AddDevice;
                                 self.add_message =
                                     Some("Device detected but not paired yet.".into());
+                                self.begin_pair_for_current_ip();
                             }
                         }
                     }
@@ -513,7 +520,12 @@ impl TuiApp {
             self.screen = Screen::Launcher;
             return Ok(());
         }
-        if self.browser.as_ref().map(|b| b.search_mode).unwrap_or(false) {
+        if self
+            .browser
+            .as_ref()
+            .map(|b| b.search_mode)
+            .unwrap_or(false)
+        {
             return self.handle_browser_search_key(key);
         }
         let rows = self.visible_nodes();
@@ -528,8 +540,7 @@ impl TuiApp {
                 if let Some(browser) = self.browser.as_mut() {
                     browser.search_mode = true;
                     browser.message = Some(
-                        "Recursive search mode. Type to filter, Enter to keep, Esc to exit."
-                            .into(),
+                        "Recursive search mode. Type to filter, Enter to keep, Esc to exit.".into(),
                     );
                 }
             }
@@ -745,7 +756,10 @@ impl TuiApp {
                 browser.message = if browser.search_query.is_empty() {
                     Some("Search cleared.".into())
                 } else {
-                    Some(format!("Filtered recursively by '{}'.", browser.search_query))
+                    Some(format!(
+                        "Filtered recursively by '{}'.",
+                        browser.search_query
+                    ))
                 };
             }
             KeyCode::Backspace => {
@@ -832,7 +846,8 @@ impl TuiApp {
         let area = context_menu_rect(menu);
         match mouse.kind {
             MouseEventKind::Down(MouseButton::Left) => {
-                if let Some(index) = menu_hit_index(area, mouse.column, mouse.row, menu.buttons.len())
+                if let Some(index) =
+                    menu_hit_index(area, mouse.column, mouse.row, menu.buttons.len())
                 {
                     let action = menu.buttons[index].action.clone();
                     self.context_menu = None;
@@ -1046,7 +1061,9 @@ impl TuiApp {
                     .into_iter()
                     .filter(|device| device.paired || !device.reachable_addrs.is_empty())
                     .collect();
-                self.launcher_index = self.launcher_index.min(self.devices.len().saturating_sub(1));
+                self.launcher_index = self
+                    .launcher_index
+                    .min(self.devices.len().saturating_sub(1));
                 self.usb_candidate = None;
                 self.usb_attached = false;
                 self.usb_hint = None;
@@ -1065,12 +1082,47 @@ impl TuiApp {
                             "{} Press 'u' to switch USB mode to network and retry.",
                             status.message
                         ),
-                        UsbStatusKind::UsbNetworkVisible => format!(
-                            "{} Press 'u' to retry endpoint recovery.",
-                            status.message
-                        ),
+                        UsbStatusKind::UsbNetworkVisible => {
+                            format!("{} Press 'u' to retry endpoint recovery.", status.message)
+                        }
                         UsbStatusKind::NoUsbHardware => status.message,
                     });
+                }
+            }
+        }
+    }
+
+    fn bootstrap_default_connect(&mut self) {
+        if self.startup_bootstrap_done {
+            return;
+        }
+        self.startup_bootstrap_done = true;
+        if !self.devices.is_empty() {
+            return;
+        }
+
+        let addr = default_device_addr();
+        match self.provider.connect(Some(addr.clone()), None, None) {
+            Ok(device) => {
+                if device.paired {
+                    self.launcher_message = Some(format!("Auto-connected to {addr}."));
+                    self.open_browser(device);
+                } else {
+                    self.add_ip = device.reachable_addrs.first().cloned().unwrap_or(addr);
+                    self.screen = Screen::AddDevice;
+                    self.add_message =
+                        Some("Device reachable but not paired. Starting pairing flow...".into());
+                    self.begin_pair_for_current_ip();
+                }
+            }
+            Err(err) => {
+                let message = err.to_string();
+                if message.contains("pairing required") {
+                    self.add_ip = addr;
+                    self.screen = Screen::AddDevice;
+                    self.begin_pair_for_current_ip();
+                } else {
+                    self.launcher_message = Some(format!("Auto-connect skipped: {message}"));
                 }
             }
         }
@@ -1216,7 +1268,9 @@ impl TuiApp {
         }
         match self.provider.list_entries(path.to_string()) {
             Ok(entries) => {
-                browser.children_cache.insert(path.to_string(), entries.clone());
+                browser
+                    .children_cache
+                    .insert(path.to_string(), entries.clone());
                 entries
             }
             Err(err) => {
@@ -1227,7 +1281,12 @@ impl TuiApp {
     }
 
     fn visible_nodes(&mut self) -> Vec<(RemoteEntry, usize)> {
-        fn walk_tree(app: &mut TuiApp, path: &str, depth: usize, out: &mut Vec<(RemoteEntry, usize)>) {
+        fn walk_tree(
+            app: &mut TuiApp,
+            path: &str,
+            depth: usize,
+            out: &mut Vec<(RemoteEntry, usize)>,
+        ) {
             let entries = app.load_children(path);
             let expanded = app
                 .browser
@@ -1380,7 +1439,9 @@ impl TuiApp {
 
         if self.devices.is_empty() {
             let text = if let Some(addr) = &self.usb_candidate {
-                format!("USB endpoint detected at {addr}. Press 'u' to recover/recheck before pairing.")
+                format!(
+                    "USB endpoint detected at {addr}. Press 'u' to recover/recheck before pairing."
+                )
             } else if let Some(hint) = &self.usb_hint {
                 hint.clone()
             } else {
@@ -1405,10 +1466,7 @@ impl TuiApp {
                         .unwrap_or_else(|| "unknown".into());
                     let badge = if device.paired { "paired" } else { "detected" };
                     ListItem::new(vec![Line::from(vec![
-                        Span::styled(
-                            &device.name,
-                            Style::default().add_modifier(Modifier::BOLD),
-                        ),
+                        Span::styled(&device.name, Style::default().add_modifier(Modifier::BOLD)),
                         Span::raw("  "),
                         Span::styled(format!("[{badge}]"), Style::default().fg(Color::Yellow)),
                         Span::raw("  "),
@@ -1417,7 +1475,10 @@ impl TuiApp {
                 })
                 .collect();
             let mut state = ListState::default();
-            state.select(Some(self.launcher_index.min(self.devices.len().saturating_sub(1))));
+            state.select(Some(
+                self.launcher_index
+                    .min(self.devices.len().saturating_sub(1)),
+            ));
             frame.render_stateful_widget(
                 List::new(items)
                     .block(Block::default().borders(Borders::ALL).title("Devices"))
@@ -1488,9 +1549,18 @@ impl TuiApp {
             Style::default()
         };
         let form = vec![
-            Line::from(vec![Span::styled("Device IP: ", Style::default().add_modifier(Modifier::BOLD)), Span::styled(self.add_ip.clone(), ip_style)]),
+            Line::from(vec![
+                Span::styled("Device IP: ", Style::default().add_modifier(Modifier::BOLD)),
+                Span::styled(self.add_ip.clone(), ip_style),
+            ]),
             Line::from(""),
-            Line::from(vec![Span::styled("Pairing PIN: ", Style::default().add_modifier(Modifier::BOLD)), Span::styled(self.add_pin.clone(), pin_style)]),
+            Line::from(vec![
+                Span::styled(
+                    "Pairing PIN: ",
+                    Style::default().add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(self.add_pin.clone(), pin_style),
+            ]),
             Line::from(""),
             Line::from("Keys: Tab switch field  c connect  p pair  o open library  Esc back"),
         ];
@@ -1514,7 +1584,11 @@ impl TuiApp {
             .unwrap_or_else(|| "Not connected yet".into());
         frame.render_widget(
             Paragraph::new(connected)
-                .block(Block::default().borders(Borders::ALL).title("Connected Device"))
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .title("Connected Device"),
+                )
                 .wrap(Wrap { trim: true }),
             chunks[2],
         );
@@ -1562,7 +1636,9 @@ impl TuiApp {
             Paragraph::new(vec![
                 Line::from(Span::styled(
                     browser.device.name.clone(),
-                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
                 )),
                 Line::from(format!(
                     "{}  |  {} items  |  search {}{}",
@@ -1587,11 +1663,13 @@ impl TuiApp {
         );
 
         let items: Vec<ListItem> = if rows.is_empty() {
-            vec![ListItem::new(Line::from(if browser.search_query.is_empty() {
-                "This folder is empty. Press 'i' to import a file."
-            } else {
-                "No recursive matches. Press '/' to edit search or backspace inside search mode."
-            }))]
+            vec![ListItem::new(Line::from(
+                if browser.search_query.is_empty() {
+                    "This folder is empty. Press 'i' to import a file."
+                } else {
+                    "No recursive matches. Press '/' to edit search or backspace inside search mode."
+                },
+            ))]
         } else {
             rows.iter()
                 .map(|(entry, depth)| {
@@ -1618,7 +1696,9 @@ impl TuiApp {
                 .collect()
         };
         let mut state = ListState::default();
-        state.select(Some(browser.selected_row.min(items.len().saturating_sub(1))));
+        state.select(Some(
+            browser.selected_row.min(items.len().saturating_sub(1)),
+        ));
         frame.render_stateful_widget(
             List::new(items)
                 .block(Block::default().borders(Borders::ALL).title("Files"))
@@ -1629,11 +1709,11 @@ impl TuiApp {
         );
 
         let status = browser.status.clone().unwrap_or(DeviceStatus {
-            battery: digital_paper_domain::BatteryStatus {
+            battery: digital_paper::BatteryStatus {
                 level_percent: None,
                 charging: false,
             },
-            storage: digital_paper_domain::StorageStatus {
+            storage: digital_paper::StorageStatus {
                 total_bytes: None,
                 free_bytes: None,
             },
@@ -1642,11 +1722,14 @@ impl TuiApp {
             wifi_enabled: false,
         });
         let status_rows = vec![
-            Row::new(vec![String::from("Battery"), status
-                .battery
-                .level_percent
-                .map(|v| format!("{v}%"))
-                .unwrap_or_else(|| "unknown".into())]),
+            Row::new(vec![
+                String::from("Battery"),
+                status
+                    .battery
+                    .level_percent
+                    .map(|v| format!("{v}%"))
+                    .unwrap_or_else(|| "unknown".into()),
+            ]),
             Row::new(vec![
                 String::from("Wi-Fi"),
                 if status.wifi_enabled {
@@ -1665,8 +1748,11 @@ impl TuiApp {
             ]),
         ];
         frame.render_widget(
-            Table::new(status_rows, [Constraint::Length(12), Constraint::Min(10)])
-                .block(Block::default().borders(Borders::ALL).title("Device Footer")),
+            Table::new(status_rows, [Constraint::Length(12), Constraint::Min(10)]).block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title("Device Footer"),
+            ),
             vertical[2],
         );
 
@@ -1709,7 +1795,9 @@ fn draw_prompt(frame: &mut Frame, prompt: &PromptState) {
         Paragraph::new(vec![
             Line::from(Span::styled(
                 prompt.title.clone(),
-                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
             )),
             Line::from(""),
             Line::from(prompt.detail.clone()),
@@ -1735,7 +1823,9 @@ fn draw_context_menu(frame: &mut Frame, menu: &ContextMenuState) {
         .map(|button| ListItem::new(Line::from(button.label.clone())))
         .collect();
     let mut state = ListState::default();
-    state.select(Some(menu.selected.min(menu.buttons.len().saturating_sub(1))));
+    state.select(Some(
+        menu.selected.min(menu.buttons.len().saturating_sub(1)),
+    ));
     frame.render_widget(Clear, area);
     frame.render_stateful_widget(
         List::new(items)
@@ -1804,7 +1894,10 @@ fn import_path(provider: &ProviderRef, local_path: &Path, remote_folder: &str) -
         let remote = format!(
             "{}/{}",
             remote_folder.trim_end_matches('/'),
-            local_path.file_name().and_then(|v| v.to_str()).unwrap_or("upload.pdf")
+            local_path
+                .file_name()
+                .and_then(|v| v.to_str())
+                .unwrap_or("upload.pdf")
         );
         provider.upload(local_path.to_string_lossy().to_string(), remote)?;
         return Ok(1);
@@ -1926,7 +2019,9 @@ fn search_walk(
 }
 
 fn parent_path(path: &str) -> &str {
-    path.rsplit_once('/').map(|(parent, _)| parent).unwrap_or("")
+    path.rsplit_once('/')
+        .map(|(parent, _)| parent)
+        .unwrap_or("")
 }
 
 fn launcher_hit_index(row: u16, item_count: usize) -> Option<usize> {

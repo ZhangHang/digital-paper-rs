@@ -9,6 +9,4 @@ anyhow.workspace = true
 clap.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-digital-paper-provider = { path = "../../crates/digital-paper-provider" }
-digital-paper-domain = { path = "../../crates/digital-paper-domain" }
-digital-paper-rust-provider = { path = "../../crates/digital-paper-rust-provider" }
+digital-paper = { path = "../../crates/digital-paper" }

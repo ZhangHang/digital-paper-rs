@@ -3,9 +3,7 @@ members = [
   "apps/digital-paper-cli",
   "apps/digital-paper-gpui",
   "apps/digital-paper-tui",
-  "crates/digital-paper-domain",
-  "crates/digital-paper-provider",
-  "crates/digital-paper-rust-provider",
+  "crates/digital-paper",
 ]
 resolver = "2"
 

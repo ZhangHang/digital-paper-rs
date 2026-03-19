@@ -1,5 +1,5 @@
 [package]
-name = "digital-paper-rust-provider"
+name = "digital-paper"
 edition.workspace = true
 license.workspace = true
 version.workspace = true
@@ -9,7 +9,6 @@ anyhow.workspace = true
 parking_lot.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
-digital-paper-domain = { path = "../digital-paper-domain" }
 serde.workspace = true
 reqwest = { version = "0.12", features = ["blocking", "json", "multipart", "cookies"] }
 openssl = "0.10"

@@ -1,8 +1,9 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use digital_paper_domain::{RemoteEntry, RemoteEntryType, UsbSwitchMode, WifiConfigInput};
-use digital_paper_provider::{rust_native_provider, ProviderRef};
-use digital_paper_rust_provider::RustNativeProvider;
+use digital_paper::{
+    provider, ProviderRef, RemoteEntry, RemoteEntryType, RustNativeProvider, UsbSwitchMode,
+    WifiConfigInput,
+};
 use serde::Serialize;
 use serde_json::{json, Value};
 use std::fs;
@@ -289,7 +290,7 @@ enum Command {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    let provider = rust_native_provider();
+    let provider = provider();
 
     match cli.command {
         Command::Discover => {
@@ -680,7 +681,11 @@ fn main() -> Result<()> {
     }
 }
 
-fn ensure_connected(provider: &ProviderRef, addr: Option<String>, serial: Option<String>) -> Result<()> {
+fn ensure_connected(
+    provider: &ProviderRef,
+    addr: Option<String>,
+    serial: Option<String>,
+) -> Result<()> {
     provider
         .connect(addr, serial, None)
         .context("connect failed")?;
@@ -730,7 +735,11 @@ fn stat_entry(provider: &ProviderRef, path: &str) -> Result<RemoteEntry> {
         .with_context(|| format!("remote path not found: {path}"))
 }
 
-fn find_entries_by_name(provider: &ProviderRef, root: &str, needle: &str) -> Result<Vec<RemoteEntry>> {
+fn find_entries_by_name(
+    provider: &ProviderRef,
+    root: &str,
+    needle: &str,
+) -> Result<Vec<RemoteEntry>> {
     let query = needle.to_ascii_lowercase();
     let mut entries = list_entries_recursive(provider, root)?;
     entries.retain(|entry| entry.name.to_ascii_lowercase().contains(&query));
@@ -738,7 +747,9 @@ fn find_entries_by_name(provider: &ProviderRef, root: &str, needle: &str) -> Res
 }
 
 fn parent_path(path: &str) -> &str {
-    path.rsplit_once('/').map(|(parent, _)| parent).unwrap_or("")
+    path.rsplit_once('/')
+        .map(|(parent, _)| parent)
+        .unwrap_or("")
 }
 
 fn parse_json_or_string(value: &str) -> Value {
@@ -790,12 +801,12 @@ fn pair_finish(json_mode: bool, pin: String) -> Result<()> {
 mod tests {
     use super::*;
     use anyhow::anyhow;
-    use digital_paper_domain::{
+    use digital_paper::Provider;
+    use digital_paper::{
         AdvancedCapabilities, BatteryStatus, ConnectionLog, DeviceStatus, DeviceSummary,
         StorageStatus, TransportKind, UsbStatus, UsbStatusKind, UsbSwitchMode, WifiConfigInput,
         WifiNetwork, USB_FALLBACK_ADDR,
     };
-    use digital_paper_provider::DptProvider;
     use std::collections::HashMap;
     use std::sync::Arc;
 
@@ -818,7 +829,7 @@ mod tests {
         Err(anyhow!("not implemented for test"))
     }
 
-    impl DptProvider for TestProvider {
+    impl Provider for TestProvider {
         fn discover_devices(&self) -> Result<Vec<DeviceSummary>> {
             unsupported()
         }
@@ -1078,7 +1089,10 @@ mod tests {
     fn parent_path_handles_root_and_nested_paths() {
         assert_eq!(parent_path("Document"), "");
         assert_eq!(parent_path("Document/Daily"), "Document");
-        assert_eq!(parent_path("Document/Daily/2026-03-13.pdf"), "Document/Daily");
+        assert_eq!(
+            parent_path("Document/Daily/2026-03-13.pdf"),
+            "Document/Daily"
+        );
     }
 
     #[test]
@@ -1164,23 +1178,59 @@ mod tests {
             vec!["digital-paper-cli", "stat", "Document/foo.pdf"],
             vec!["digital-paper-cli", "find", "--name", "2026-03-13"],
             vec!["digital-paper-cli", "sync", "./out", "Document/Summaries"],
-            vec!["digital-paper-cli", "sync", "./out", "Document/Summaries", "--dry-run"],
+            vec![
+                "digital-paper-cli",
+                "sync",
+                "./out",
+                "Document/Summaries",
+                "--dry-run",
+            ],
             vec!["digital-paper-cli", "usb-status"],
             vec!["digital-paper-cli", "usb-switch", "--mode", "ecm"],
             vec!["digital-paper-cli", "usb-recover"],
-            vec!["digital-paper-cli", "move", "Document/a.pdf", "Document/b.pdf"],
-            vec!["digital-paper-cli", "move-document", "Document/a.pdf", "Document/b.pdf"],
-            vec!["digital-paper-cli", "copy", "Document/a.pdf", "Document/b.pdf"],
-            vec!["digital-paper-cli", "copy-document", "Document/a.pdf", "Document/b.pdf"],
+            vec![
+                "digital-paper-cli",
+                "move",
+                "Document/a.pdf",
+                "Document/b.pdf",
+            ],
+            vec![
+                "digital-paper-cli",
+                "move-document",
+                "Document/a.pdf",
+                "Document/b.pdf",
+            ],
+            vec![
+                "digital-paper-cli",
+                "copy",
+                "Document/a.pdf",
+                "Document/b.pdf",
+            ],
+            vec![
+                "digital-paper-cli",
+                "copy-document",
+                "Document/a.pdf",
+                "Document/b.pdf",
+            ],
             vec!["digital-paper-cli", "list-all"],
             vec!["digital-paper-cli", "list-documents"],
             vec!["digital-paper-cli", "exists", "Document/foo.pdf"],
             vec!["digital-paper-cli", "is-folder", "Document"],
-            vec!["digital-paper-cli", "register-info", "--addr", USB_FALLBACK_ADDR],
+            vec![
+                "digital-paper-cli",
+                "register-info",
+                "--addr",
+                USB_FALLBACK_ADDR,
+            ],
             vec!["digital-paper-cli", "battery"],
             vec!["digital-paper-cli", "firmware-version"],
             vec!["digital-paper-cli", "mac-address"],
-            vec!["digital-paper-cli", "api-version", "--addr", USB_FALLBACK_ADDR],
+            vec![
+                "digital-paper-cli",
+                "api-version",
+                "--addr",
+                USB_FALLBACK_ADDR,
+            ],
             vec!["digital-paper-cli", "list-wifi"],
             vec!["digital-paper-cli", "scan-wifi"],
             vec!["digital-paper-cli", "add-wifi", "ssid", "psk", "secret"],
@@ -1201,7 +1251,7 @@ mod tests {
                 "--dns1",
                 "8.8.8.8",
                 "--proxy",
-                "false"
+                "false",
             ],
             vec!["digital-paper-cli", "remove-wifi", "ssid", "psk"],
             vec!["digital-paper-cli", "enable-wifi"],
@@ -1212,9 +1262,20 @@ mod tests {
             vec!["digital-paper-cli", "set-configuration", "./cfg.json"],
             vec!["digital-paper-cli", "set-datetime"],
             vec!["digital-paper-cli", "list-templates"],
-            vec!["digital-paper-cli", "upload-template", "./template.pdf", "Template/template.pdf"],
+            vec![
+                "digital-paper-cli",
+                "upload-template",
+                "./template.pdf",
+                "Template/template.pdf",
+            ],
             vec!["digital-paper-cli", "delete-template", "daily"],
-            vec!["digital-paper-cli", "display-document", "doc-id", "--page", "2"],
+            vec![
+                "digital-paper-cli",
+                "display-document",
+                "doc-id",
+                "--page",
+                "2",
+            ],
             vec!["digital-paper-cli", "screenshot", "/tmp/out.jpg"],
             vec!["digital-paper-cli", "ping"],
             vec!["digital-paper-cli", "update-firmware", "./FwUpdater.pkg"],

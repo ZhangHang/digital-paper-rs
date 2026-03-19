@@ -1,8 +1,8 @@
 use anyhow::Result;
-use digital_paper_domain::{
-    DeviceStatus, DeviceSummary, RemoteEntry, RemoteEntryType, DEFAULT_DEVICE_HOST,
+use digital_paper::{
+    provider, DeviceStatus, DeviceSummary, ProviderRef, RemoteEntry, RemoteEntryType,
+    DEFAULT_DEVICE_HOST,
 };
-use digital_paper_provider::{rust_native_provider, ProviderRef};
 use gpui::{
     actions, div, prelude::FluentBuilder, px, size, App, AppContext, Application, Bounds,
     ClickEvent, Context, ExternalPaths, InteractiveElement, IntoElement, KeyBinding, Menu,
@@ -63,7 +63,7 @@ fn main() {
     app.run(move |cx: &mut App| {
         init_components(cx);
 
-        let provider = rust_native_provider();
+        let provider = provider();
 
         let shared = Arc::new(Mutex::new(SharedState {
             provider,
@@ -306,7 +306,6 @@ impl LauncherView {
             cx.notify();
         });
     }
-
 }
 
 impl Render for LauncherView {
@@ -330,15 +329,21 @@ impl Render for LauncherView {
         }
         if let Some(addr) = self.pending_auto_pair_addr.take() {
             let shared = self.shared.clone();
-            cx.on_next_frame(window, move |this, window, cx| {
-                match open_add_device_window(shared.clone(), Some(addr.clone()), true, cx) {
+            cx.on_next_frame(
+                window,
+                move |this, window, cx| match open_add_device_window(
+                    shared.clone(),
+                    Some(addr.clone()),
+                    true,
+                    cx,
+                ) {
                     Ok(_) => window.remove_window(),
                     Err(err) => {
                         this.error = Some(format!("Could not start pairing for {}: {}", addr, err));
                         cx.notify();
                     }
-                }
-            });
+                },
+            );
         }
         div()
             .flex()
@@ -601,7 +606,10 @@ impl BrowserView {
         cx.notify();
     }
 
-    fn perform_transfer_sync(provider: ProviderRef, operation: TransferOperation) -> TransferOutcome {
+    fn perform_transfer_sync(
+        provider: ProviderRef,
+        operation: TransferOperation,
+    ) -> TransferOutcome {
         match operation {
             TransferOperation::Import { paths, folder } => {
                 let mut uploaded = 0usize;
@@ -1310,8 +1318,7 @@ impl AddDeviceView {
                 match result {
                     Ok(_) => {
                         this.message = Some(
-                            "The DPT should now show a PIN. Enter it here, then click Pair."
-                                .into(),
+                            "The DPT should now show a PIN. Enter it here, then click Pair.".into(),
                         );
                     }
                     Err(err) => {

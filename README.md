@@ -35,9 +35,7 @@ This repository is implemented as a Rust-first project for personal usage.
 - `apps/digital-paper-cli` CLI app
 - `apps/digital-paper-tui` terminal UI app
 - `apps/digital-paper-gpui` desktop app
-- `crates/digital-paper-domain` shared types/constants/errors
-- `crates/digital-paper-provider` provider interface layer
-- `crates/digital-paper-rust-provider` native Rust implementation
+- `crates/digital-paper` unified core library (types + provider + transport implementation)
 
 ## Quick Start
 
@@ -67,6 +65,7 @@ cargo run -p digital-paper-gpui
 ## Configuration
 
 - `DPT_DEFAULT_ADDR`: default target address used by TUI/GPUI add-device flows (defaults to `digitalpaper.local`)
+- `DPT_CONFIG_DIR`: shared credentials/state directory for CLI/TUI/GUI (`deviceid.dat`, `privatekey.dat`, pending pairing, known devices)
 
 Bundle app:
 

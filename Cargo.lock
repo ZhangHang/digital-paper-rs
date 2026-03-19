@@ -1514,60 +1514,11 @@ dependencies = [
 ]
 
 [[package]]
-name = "digital-paper-cli"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "clap",
- "digital-paper-domain",
- "digital-paper-provider",
- "digital-paper-rust-provider",
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "digital-paper-domain"
-version = "0.1.0"
-dependencies = [
- "serde",
- "thiserror 2.0.18",
-]
-
-[[package]]
-name = "digital-paper-gpui"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "digital-paper-domain",
- "digital-paper-provider",
- "gpui",
- "gpui-component",
- "if-addrs",
- "parking_lot",
- "reqwest",
- "rfd",
-]
-
-[[package]]
-name = "digital-paper-provider"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "digital-paper-domain",
- "digital-paper-rust-provider",
- "parking_lot",
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "digital-paper-rust-provider"
+name = "digital-paper"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "base64",
- "digital-paper-domain",
  "hmac",
  "if-addrs",
  "num-bigint",
@@ -1586,13 +1537,37 @@ dependencies = [
 ]
 
 [[package]]
+name = "digital-paper-cli"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "digital-paper",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "digital-paper-gpui"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "digital-paper",
+ "gpui",
+ "gpui-component",
+ "if-addrs",
+ "parking_lot",
+ "reqwest",
+ "rfd",
+]
+
+[[package]]
 name = "digital-paper-tui"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "crossterm",
- "digital-paper-domain",
- "digital-paper-provider",
+ "digital-paper",
  "if-addrs",
  "parking_lot",
  "ratatui",

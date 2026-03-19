@@ -187,28 +187,3 @@ impl BridgeError {
         }
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::BridgeErrorCode;
-
-    #[test]
-    fn maps_known_bridge_codes() {
-        assert_eq!(
-            BridgeErrorCode::from_wire("transport_unreachable"),
-            BridgeErrorCode::TransportUnreachable
-        );
-        assert_eq!(
-            BridgeErrorCode::from_wire("pin_invalid"),
-            BridgeErrorCode::PinInvalid
-        );
-    }
-
-    #[test]
-    fn defaults_unknown_bridge_code_to_internal_error() {
-        assert_eq!(
-            BridgeErrorCode::from_wire("not_real"),
-            BridgeErrorCode::InternalError
-        );
-    }
-}

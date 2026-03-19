@@ -1,9 +1,15 @@
-use base64::Engine;
-use digital_paper_domain::{
-    AdvancedCapabilities, BatteryStatus, ConnectionLog, DeviceStatus, DeviceSummary, RemoteEntry,
-    RemoteEntryType, StorageStatus, TransportKind, UsbStatus, UsbStatusKind, UsbSwitchMode,
-    WifiConfigInput, WifiNetwork, DEFAULT_DEVICE_HOST, USB_FALLBACK_ADDR,
+mod domain;
+mod provider;
+
+pub use domain::{
+    AdvancedCapabilities, BatteryStatus, BridgeError, BridgeErrorCode, ConnectionLog, DeviceStatus,
+    DeviceSummary, RemoteEntry, RemoteEntryType, SavedDevice, StorageStatus, TransportKind,
+    UsbStatus, UsbStatusKind, UsbSwitchMode, WifiConfigInput, WifiNetwork, DEFAULT_DEVICE_HOST,
+    USB_FALLBACK_ADDR,
 };
+pub use provider::*;
+
+use base64::Engine;
 use hmac::{Hmac, Mac};
 use num_bigint::BigUint;
 use openssl::{hash::MessageDigest, pkey::PKey, sign::Signer};
@@ -140,7 +146,6 @@ impl RustNativeProvider {
 
     pub fn discover_devices(&self) -> std::result::Result<Vec<DeviceSummary>, RustProviderError> {
         let mut devices = Vec::new();
-        let credentials = read_credentials_files().unwrap_or((None, None));
         let addrs = candidate_addrs();
         self.log(format!("Discovery candidates: {}", addrs.join(", ")));
         let probes = probe_addrs_concurrently(&addrs, 24, Duration::from_millis(750));
@@ -148,12 +153,7 @@ impl RustNativeProvider {
             let detected = probes.get(&addr).cloned().flatten();
             let is_usb = addr.starts_with("172.25.47.") || addr.starts_with("172.20.");
             if let Some(info) = detected {
-                let paired = match &credentials {
-                    (Some(client_id), Some(private_key_pem)) => self
-                        .authenticate_session(&addr, client_id.clone(), private_key_pem.clone())
-                        .is_ok(),
-                    _ => false,
-                };
+                let paired = self.authenticate_with_any_credentials(&addr).is_ok();
                 devices.push(DeviceSummary {
                     id: format!("rust-{addr}"),
                     serial: info.serial,
@@ -230,19 +230,14 @@ impl RustNativeProvider {
                 .ok_or(RustProviderError::DeviceNotFound)?
         };
 
-        if !probe_addr(&target) && target != DEFAULT_DEVICE_HOST {
+        if !probe_addr(&target) {
             return Err(RustProviderError::TransportUnreachable);
         }
 
         let mut paired = false;
-        let mut session = None;
-        if let (Some(client_id), Some(private_key_pem)) =
-            read_credentials_files().unwrap_or((None, None))
-        {
-            if let Ok(s) = self.authenticate_session(&target, client_id, private_key_pem) {
-                paired = true;
-                session = Some(s);
-            }
+        let session = self.authenticate_with_any_credentials(&target).ok();
+        if session.is_some() {
+            paired = true;
         }
 
         let device = DeviceSummary {
@@ -527,7 +522,11 @@ impl RustNativeProvider {
         Ok(())
     }
 
-    pub fn copy_entry(&self, src: String, dst: String) -> std::result::Result<(), RustProviderError> {
+    pub fn copy_entry(
+        &self,
+        src: String,
+        dst: String,
+    ) -> std::result::Result<(), RustProviderError> {
         let session = self.require_session()?;
         let old_id = self.resolve_object(&session, &src)?.entry_id;
         let (parent_id, new_name) = match self.resolve_object(&session, &dst) {
@@ -621,8 +620,9 @@ impl RustNativeProvider {
                 "register information http error: status={status} body={text}"
             )));
         }
-        serde_json::from_str(&text)
-            .map_err(|e| RustProviderError::Internal(format!("register info parse failed: {e}; body={text}")))
+        serde_json::from_str(&text).map_err(|e| {
+            RustProviderError::Internal(format!("register info parse failed: {e}; body={text}"))
+        })
     }
 
     pub fn battery_info(&self) -> std::result::Result<Value, RustProviderError> {
@@ -669,8 +669,9 @@ impl RustNativeProvider {
                 "api version http error: status={status} body={text}"
             )));
         }
-        let value: Value = serde_json::from_str(&text)
-            .map_err(|e| RustProviderError::Internal(format!("api version parse failed: {e}; body={text}")))?;
+        let value: Value = serde_json::from_str(&text).map_err(|e| {
+            RustProviderError::Internal(format!("api version parse failed: {e}; body={text}"))
+        })?;
         value
             .get("value")
             .and_then(Value::as_str)
@@ -764,7 +765,10 @@ impl RustNativeProvider {
         })
     }
 
-    pub fn add_wifi_full(&self, config: WifiConfigInput) -> std::result::Result<(), RustProviderError> {
+    pub fn add_wifi_full(
+        &self,
+        config: WifiConfigInput,
+    ) -> std::result::Result<(), RustProviderError> {
         let session = self.require_session()?;
         self.put_json(
             &session,
@@ -844,7 +848,11 @@ impl RustNativeProvider {
     pub fn set_datetime_now(&self) -> std::result::Result<(), RustProviderError> {
         let session = self.require_session()?;
         let now = chrono_like_now_utc();
-        self.put_json(&session, "/system/configs/datetime", &json!({ "value": now }))?;
+        self.put_json(
+            &session,
+            "/system/configs/datetime",
+            &json!({ "value": now }),
+        )?;
         self.log("Device datetime updated".into());
         Ok(())
     }
@@ -897,7 +905,9 @@ impl RustNativeProvider {
             .and_then(Value::as_array)
             .into_iter()
             .flatten()
-            .find(|item| item.get("template_name").and_then(Value::as_str) == Some(template_name.as_str()))
+            .find(|item| {
+                item.get("template_name").and_then(Value::as_str) == Some(template_name.as_str())
+            })
             .and_then(|item| item.get("note_template_id").and_then(Value::as_str))
             .ok_or(RustProviderError::DeviceNotFound)?;
         self.delete_empty(
@@ -919,7 +929,9 @@ impl RustNativeProvider {
             "/viewer/controls/open2",
             &json!({ "document_id": document_id, "page": page }),
         )?;
-        self.log(format!("Display requested for document {document_id} page {page}"));
+        self.log(format!(
+            "Display requested for document {document_id} page {page}"
+        ));
         Ok(())
     }
 
@@ -1137,7 +1149,9 @@ impl RustNativeProvider {
         for m in modes {
             let bytes: &[u8] = match m {
                 UsbSwitchMode::Ecm => &[0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x01, 0x04],
-                UsbSwitchMode::Rndis => &[0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x04],
+                UsbSwitchMode::Rndis => {
+                    &[0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x04]
+                }
                 UsbSwitchMode::Auto => continue,
             };
             for tty in &ttys {
@@ -1145,8 +1159,10 @@ impl RustNativeProvider {
             }
             thread::sleep(Duration::from_millis(900));
             let status = usb_status_inner()?;
-            if matches!(status.kind, UsbStatusKind::UsbNetworkVisible | UsbStatusKind::DptEndpointReachable)
-            {
+            if matches!(
+                status.kind,
+                UsbStatusKind::UsbNetworkVisible | UsbStatusKind::DptEndpointReachable
+            ) {
                 return Ok(status);
             }
         }
@@ -1257,7 +1273,10 @@ impl RustNativeProvider {
         let mut out = HashMap::new();
         let prefix = format!("{}/", remote_root.trim_end_matches('/'));
         for entry in entries {
-            let ty = entry.get("entry_type").and_then(Value::as_str).unwrap_or("");
+            let ty = entry
+                .get("entry_type")
+                .and_then(Value::as_str)
+                .unwrap_or("");
             if ty != "document" {
                 continue;
             }
@@ -1288,12 +1307,7 @@ impl RustNativeProvider {
         let Some(addr) = state.selected_addr.clone() else {
             return Err(RustProviderError::PairingRequired);
         };
-        let (Some(client_id), Some(private_key_pem)) =
-            read_credentials_files().unwrap_or((None, None))
-        else {
-            return Err(RustProviderError::PairingRequired);
-        };
-        let session = self.authenticate_session(&addr, client_id, private_key_pem)?;
+        let session = self.authenticate_with_any_credentials(&addr)?;
         state.session = Some(session.clone());
         Ok(session)
     }
@@ -1302,16 +1316,44 @@ impl RustNativeProvider {
         &self,
         addr: &str,
     ) -> std::result::Result<RustSession, RustProviderError> {
-        let (Some(client_id), Some(private_key_pem)) =
-            read_credentials_files().unwrap_or((None, None))
-        else {
-            return Err(RustProviderError::PairingRequired);
-        };
-        let session = self.authenticate_session(addr, client_id, private_key_pem)?;
+        let session = self.authenticate_with_any_credentials(addr)?;
         let mut state = self.state.lock();
         state.selected_addr = Some(addr.to_string());
         state.session = Some(session.clone());
         Ok(session)
+    }
+
+    fn authenticate_with_any_credentials(
+        &self,
+        addr: &str,
+    ) -> std::result::Result<RustSession, RustProviderError> {
+        let credentials = read_credentials_candidates();
+        if credentials.is_empty() {
+            return Err(RustProviderError::PairingRequired);
+        }
+        let mut last_error = RustProviderError::AuthFailed;
+        for (idx, (client_id, private_key_pem)) in credentials.into_iter().enumerate() {
+            match self.authenticate_session(addr, client_id, private_key_pem) {
+                Ok(session) => return Ok(session),
+                Err(err) => {
+                    self.log(format!(
+                        "credential candidate #{} failed for {}: {}",
+                        idx + 1,
+                        addr,
+                        err
+                    ));
+                    last_error = err;
+                }
+            }
+        }
+        self.log(format!(
+            "no credential candidate authenticated for {}; pairing required",
+            addr
+        ));
+        match last_error {
+            RustProviderError::TransportUnreachable => Err(RustProviderError::TransportUnreachable),
+            _ => Err(RustProviderError::PairingRequired),
+        }
     }
 
     fn authenticate_session(
@@ -1325,7 +1367,9 @@ impl RustNativeProvider {
             match self.authenticate_session_once(addr, &client_id, &private_key_pem) {
                 Ok(session) => return Ok(session),
                 Err(err @ RustProviderError::AuthFailed)
-                | Err(err @ RustProviderError::Internal(_)) if attempt < 3 => {
+                | Err(err @ RustProviderError::Internal(_))
+                    if attempt < 3 =>
+                {
                     last_error = Some(err);
                     thread::sleep(Duration::from_millis(250));
                 }
@@ -1363,8 +1407,9 @@ impl RustNativeProvider {
                 "nonce http error: status={nonce_status} body={nonce_text}"
             )));
         }
-        let nonce_value: Value = serde_json::from_str(&nonce_text)
-            .map_err(|e| RustProviderError::Internal(format!("parse nonce failed: {e}; body={nonce_text}")))?;
+        let nonce_value: Value = serde_json::from_str(&nonce_text).map_err(|e| {
+            RustProviderError::Internal(format!("parse nonce failed: {e}; body={nonce_text}"))
+        })?;
         let nonce = nonce_value
             .get("nonce")
             .and_then(Value::as_str)
@@ -1476,8 +1521,9 @@ impl RustNativeProvider {
             "d": b64(&ya),
             "e": b64(&m2hmac),
         });
-        let m2_text = serde_json::to_string(&m2)
-            .map_err(|e| RustProviderError::Internal(format!("register/hash encode failed: {e}")))?;
+        let m2_text = serde_json::to_string(&m2).map_err(|e| {
+            RustProviderError::Internal(format!("register/hash encode failed: {e}"))
+        })?;
         thread::sleep(Duration::from_secs(1));
         let hash_response = client
             .post(format!("{reg_base}register/hash"))
@@ -1499,8 +1545,11 @@ impl RustNativeProvider {
                 m2_text,
             )));
         }
-        let m3: Value = serde_json::from_str(&hash_text)
-            .map_err(|e| RustProviderError::Internal(format!("register/hash parse failed: {e}; body={hash_text}")))?;
+        let m3: Value = serde_json::from_str(&hash_text).map_err(|e| {
+            RustProviderError::Internal(format!(
+                "register/hash parse failed: {e}; body={hash_text}"
+            ))
+        })?;
 
         let m3_a = decode_base64_bytes(value_str(&m3, "a")?)?;
         if m3_a != n2 {
@@ -1594,8 +1643,9 @@ impl RustNativeProvider {
                 wrapped_rs.len(),
             )));
         }
-        let m5: Value = serde_json::from_str(&ca_text)
-            .map_err(|e| RustProviderError::Internal(format!("register/ca parse failed: {e}; body={ca_text}")))?;
+        let m5: Value = serde_json::from_str(&ca_text).map_err(|e| {
+            RustProviderError::Internal(format!("register/ca parse failed: {e}; body={ca_text}"))
+        })?;
         let m5_a = decode_base64_bytes(value_str(&m5, "a")?)?;
         if m5_a != n2 {
             return Err(RustProviderError::Internal(format!(
@@ -2089,9 +2139,10 @@ fn local_documents(
         if ext != "pdf" {
             continue;
         }
-        let rel = entry.path().strip_prefix(&root).map_err(|e| {
-            RustProviderError::Internal(format!("sync relative path failed: {e}"))
-        })?;
+        let rel = entry
+            .path()
+            .strip_prefix(&root)
+            .map_err(|e| RustProviderError::Internal(format!("sync relative path failed: {e}")))?;
         let rel = rel.to_string_lossy().replace('\\', "/");
         let remote_path = format!("{}/{}", remote_root.trim_end_matches('/'), rel);
         let metadata = fs::metadata(entry.path())
@@ -2610,19 +2661,33 @@ fn is_private_ipv4(ip: Ipv4Addr) -> bool {
         || (oct[0] == 192 && oct[1] == 168)
 }
 
-fn read_credentials_files() -> Option<(Option<String>, Option<String>)> {
-    let mut device_id = read_trimmed(default_device_id_path()).ok();
-    let mut private_key = read_trimmed(default_private_key_path()).ok();
-    if device_id.is_none() || private_key.is_none() {
-        if let Ok((device, key)) = find_credentials_in_folder(sony_app_config_dir()) {
-            device_id = device_id.or_else(|| read_trimmed(device).ok());
-            private_key = private_key.or_else(|| read_trimmed(key).ok());
-        } else {
-            device_id = device_id.or_else(|| read_trimmed(sony_device_id_path()).ok());
-            private_key = private_key.or_else(|| read_trimmed(sony_private_key_path()).ok());
-        }
+fn read_credentials_candidates() -> Vec<(String, String)> {
+    let mut out = Vec::new();
+
+    if let (Ok(device_id), Ok(private_key)) = (
+        read_trimmed(default_device_id_path()),
+        read_trimmed(default_private_key_path()),
+    ) {
+        out.push((device_id, private_key));
     }
-    Some((device_id, private_key))
+
+    if let Ok((device_path, key_path)) = find_credentials_in_folder(sony_app_config_dir()) {
+        if let (Ok(device_id), Ok(private_key)) =
+            (read_trimmed(device_path), read_trimmed(key_path))
+        {
+            out.push((device_id, private_key));
+        }
+    } else if let (Ok(device_id), Ok(private_key)) = (
+        read_trimmed(sony_device_id_path()),
+        read_trimmed(sony_private_key_path()),
+    ) {
+        out.push((device_id, private_key));
+    }
+
+    let mut dedup = BTreeSet::new();
+    out.into_iter()
+        .filter(|pair| dedup.insert(pair.clone()))
+        .collect()
 }
 
 fn default_device_id_path() -> PathBuf {
@@ -2653,6 +2718,12 @@ fn sony_private_key_path() -> PathBuf {
 }
 
 fn home_config_dir() -> PathBuf {
+    if let Some(path) = std::env::var_os("DPT_CONFIG_DIR") {
+        return PathBuf::from(path);
+    }
+    if let Some(path) = std::env::var_os("XDG_CONFIG_HOME") {
+        return PathBuf::from(path).join("dpt");
+    }
     std::env::var("HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from("."))
@@ -2673,8 +2744,9 @@ fn save_pending_pairing(pending: &PendingPairing) -> std::result::Result<(), Rus
     };
     fs::create_dir_all(home_config_dir())
         .map_err(|e| RustProviderError::Internal(format!("create config dir failed: {e}")))?;
-    let text = serde_json::to_string_pretty(&value)
-        .map_err(|e| RustProviderError::Internal(format!("serialize pending pairing failed: {e}")))?;
+    let text = serde_json::to_string_pretty(&value).map_err(|e| {
+        RustProviderError::Internal(format!("serialize pending pairing failed: {e}"))
+    })?;
     fs::write(pending_pairing_path(), text)
         .map_err(|e| RustProviderError::Internal(format!("write pending pairing failed: {e}")))?;
     Ok(())
@@ -2715,7 +2787,9 @@ fn clear_pending_pairing() -> std::result::Result<(), RustProviderError> {
     match fs::remove_file(pending_pairing_path()) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(RustProviderError::Internal(format!("remove pending pairing failed: {e}"))),
+        Err(e) => Err(RustProviderError::Internal(format!(
+            "remove pending pairing failed: {e}"
+        ))),
     }
 }
 
@@ -2783,7 +2857,10 @@ fn probe_dpt_info(addr: &str, timeout: Duration) -> Option<ProbeInfo> {
         .timeout(timeout)
         .build()
         .map_err(|err| {
-            append_debug_log("probe", &format!("Failed to build HTTP client for {addr}: {err}"));
+            append_debug_log(
+                "probe",
+                &format!("Failed to build HTTP client for {addr}: {err}"),
+            );
             err
         })
         .ok()?;
@@ -2818,7 +2895,10 @@ fn probe_dpt_info(addr: &str, timeout: Duration) -> Option<ProbeInfo> {
     if !response.status().is_success() {
         append_debug_log(
             "probe",
-            &format!("register/information returned {} for {addr}", response.status()),
+            &format!(
+                "register/information returned {} for {addr}",
+                response.status()
+            ),
         );
         return None;
     }
@@ -2876,11 +2956,7 @@ fn append_debug_log(component: &str, message: &str) {
     if let Some(parent) = path.parent() {
         let _ = fs::create_dir_all(parent);
     }
-    if let Ok(mut file) = fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
-    {
+    if let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open(&path) {
         let _ = file.write_all(line.as_bytes());
     }
 }
@@ -2895,7 +2971,10 @@ struct RoutedCandidates {
     mismatches: Vec<String>,
 }
 
-fn filter_candidates_by_usb_route(candidates: &[String], iface_names: &[String]) -> RoutedCandidates {
+fn filter_candidates_by_usb_route(
+    candidates: &[String],
+    iface_names: &[String],
+) -> RoutedCandidates {
     if iface_names.is_empty() {
         return RoutedCandidates {
             filtered: candidates.to_vec(),
@@ -2920,11 +2999,16 @@ fn filter_candidates_by_usb_route(candidates: &[String], iface_names: &[String])
             mismatches.push(format!("{addr}->{route_iface}"));
             append_debug_log(
                 "usb",
-                &format!("Skipping USB probe target {addr}; route uses non-USB iface {route_iface}"),
+                &format!(
+                    "Skipping USB probe target {addr}; route uses non-USB iface {route_iface}"
+                ),
             );
         }
     }
-    RoutedCandidates { filtered, mismatches }
+    RoutedCandidates {
+        filtered,
+        mismatches,
+    }
 }
 
 fn route_interface_for_addr(addr: &str) -> Option<String> {
@@ -3122,7 +3206,7 @@ mod tests {
         const SAMPLE_WIFI_ADDR: &str = "192.168.1.92";
         let _guard = HOME_TEST_LOCK.lock().expect("lock home test");
         let temp_home = env::temp_dir().join(format!(
-            "digital-paper-rust-provider-test-{}",
+            "digital-paper-test-{}",
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
@@ -3134,8 +3218,11 @@ mod tests {
             env::set_var("HOME", &temp_home);
         }
 
-        save_known_addrs([SAMPLE_WIFI_ADDR.to_string(), DEFAULT_DEVICE_HOST.to_string()])
-            .expect("save known addrs");
+        save_known_addrs([
+            SAMPLE_WIFI_ADDR.to_string(),
+            DEFAULT_DEVICE_HOST.to_string(),
+        ])
+        .expect("save known addrs");
         let known = read_known_addrs();
         assert!(known.iter().any(|a| a == SAMPLE_WIFI_ADDR));
         assert!(known.iter().any(|a| a == DEFAULT_DEVICE_HOST));
